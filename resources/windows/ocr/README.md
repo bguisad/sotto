@@ -48,7 +48,7 @@ Native model outputs are borrowed by synchronous pipeline consumers: full probab
 
 PP-OCR has a 5-minute idle deadline, and Windows OCR has a 30-second idle deadline. Each is measured from the actual completion of the most recent request that used that engine. Using system OCR does not renew idle local sessions, or vice versa. Local inference and system fallback share one admission gate for the full request. Queued requests, active inference and cancellation while a native call is still running prevent idle release; cancellation alone does not mean inference has returned. Once admission is returned, already-expired resources are scheduled immediately. Admission/worker contention uses a one-second retry deadline that requests using the other engine do not postpone.
 
-When idle, Sotto closes both local model sessions, drops the recognizer and dictionary references, and terminates and waits for an idle PowerShell worker. The next request initializes the resources it needs again; failed initialization is not cached. ONNX Runtime's successful DLL, environment and shared memory-info initialization remain loaded for the process lifetime. Idle cleanup does not unload the runtime, destroy the screenshot/bubble native windows, force a GC or call `FreeOSMemory`. It targets retained OCR resources, not peak inference memory or a guaranteed return to the pre-OCR baseline.
+When idle, Sotto closes both local model sessions, drops the recognizer and dictionary references, and terminates and waits for an idle PowerShell worker. The next request initializes the resources it needs again; failed initialization is not cached. ONNX Runtime's successful DLL, environment and shared memory-info initialization remain loaded for the process lifetime. OCR idle cleanup does not unload the runtime, force a GC or call `FreeOSMemory`. Screenshot windows have a separate lifetime: used overlays are destroyed after their capture leases return, and unused hidden overlays expire after 10 seconds. Bubble windows retain their existing reuse policy. It targets retained OCR resources, not peak inference memory or a guaranteed return to the pre-OCR baseline.
 
 Set `SOTTO_OCR_IDLE` for PP-OCR or `SOTTO_OCR_WINRT_IDLE` for Windows OCR. Sotto reads both variables at startup. Each accepts positive durations such as `5s` and `1m30s`. An empty value uses that engine's default. An invalid value logs a diagnostic and uses the same default. Use both default deadlines for at least one acceptance run. An `init` stage on the next OCR summary indicates reconstruction after idle release.
 
@@ -70,11 +70,9 @@ For comparisons, set environment variables before launching a fresh app process:
 
 ### Windows memory and latency comparisons
 
-Keep a build of the previous commit and fixed, non-private screenshot samples. Compare builds on the same Windows host, CPU, architecture and environment. Record the main process and its PowerShell worker separately; include PID, working set, Private Bytes, Go heap, thread/handle counts and actual sample times. Do not interpret working-set trimming alone as reclaimed private allocations.
+Keep a build of the previous commit and fixed, non-private screenshot samples. Compare builds on the same Windows host, CPU, architecture and environment. Use Task Manager to observe CPU, working set, commit size, thread and handle counts for the main process and its PowerShell worker separately. Record the build and scenario alongside each observation; a smaller working set alone does not establish that all allocations were released.
 
-For each build, record the unused baseline, initialized resources, repeated complete OCR calls, and the first complete OCR after idle release. Compare cold, warm and rebuilt requests using at least 5 observations per group, reporting median and maximum total, init, detection, recognition, fallback and queue-wait times. The added cost is rebuilt **complete OCR minus warm complete OCR**, not session construction alone. Reconstruction begins after screenshot selection finishes, so the selection gesture does not hide this delay.
-
-Use a temporary diagnostic probe around resource release under admission to timestamp actual cleanup completion and measure session-close and worker-termination/Wait durations. Also control a request arriving during cleanup and record its queue wait and total time. Sample natural memory immediately, 30 seconds and 120 seconds after cleanup completes without another OCR request; record sampling offsets. Keep any explicit GC or `FreeOSMemory` experiment in separate runs. No such operations are part of the normal release path.
+For each build, compare a fresh idle app, the first OCR, repeated warm OCR, the idle state after resources are released, and the first OCR after rebuilding resources. Observe end-to-end responsiveness after completing the screenshot selection, including requests arriving during cleanup. Note visible pauses and whether memory settles after idle; custom heap probes and precise sampling schedules are not required for acceptance.
 
 Repeat at least 20 release/rebuild cycles and check for growing private memory, worker count, handles or threads. With the defaults, verify that using PP-OCR every 2–3 minutes keeps sessions warm and that two Windows OCR calls within 30 seconds reuse the worker. Check that a new worker can recognize after release, canceled native inference is never closed midway, and real Chinese/English/long screenshots and language-pack fallback retain their results. Hosted CI validates lifecycle and native session reconstruction but does not replace this desktop memory, accuracy and latency acceptance.
 
@@ -107,3 +105,11 @@ Remove-Item Env:SOTTO_OCR_PREFLIGHT
 Both benchmark cases run the same warm native recognition model and checksum consumer on a zero input. `copied` adds a full output copy; `borrowed` consumes native storage directly. The comparison reports Go allocation traffic and bridge/inference time, excluding image preprocessing and CTC decoding. Native allocations and complete-OCR peak/idle process memory require desktop sampling.
 
 Capture acceptance additionally covers 1080p/4K selections, mixed DPI and negative monitor origins, and rejecting an over-budget physical selection before GDI allocation. A valid clipped selection must still work even when its unclipped dimensions exceed the budget. Check the smaller-selection error text in the screenshot bubble.
+
+
+The Windows OCR worker reads UTF-8 requests through a buffered StreamReader,
+clears per-request managed payload references after disposing native images, and
+still expires after 30 seconds. Run `SOTTO_OCR_PREFLIGHT=1 go test ./internal/ocr
+-run '^TestWinRTNativeRepeatedRequests$' -count=1 -v` on Windows to exercise two
+requests against the real worker and installed language packs. Default Windows
+tests parse the embedded PowerShell script and exercise pipe recovery separately.

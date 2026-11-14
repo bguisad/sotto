@@ -95,7 +95,7 @@ Key invariants:
 ## Streaming Translations
 
 - Bilibili, OpenAI (including compatible endpoints), SiliconFlow, and Zhipu request Chat Completions SSE. Read only `delta.content` from the first choice, ignoring role, reasoning, and usage. A full translation is still accepted if a compatible endpoint returns ordinary JSON.
-- SSE has no size limit on the entire transport body, so repeated metadata and ignored reasoning do not consume the translation budget. Individual events (including multiline data) and cumulative translation text each have a 1 MiB limit. Exceeding a limit preserves previous text and returns an explicit error. Ordinary JSON responses remain limited to 1 MiB. Connection and TLS handshake timeouts are 10 seconds each; response headers have 30 seconds. Allow up to 60 seconds for the first body bytes; thereafter cancel only after 30 consecutive seconds without new bytes. Reasoning and heartbeats also reset the idle timer. Continuous output has no overall duration limit. A timeout preserves partial text and reports "生成超时，译文未完成，请重试".
+- SSE has no size limit on the entire transport body, so repeated metadata and ignored reasoning do not consume the translation budget. The provider parser limits individual events (including multiline data) and accumulated translated text within one response to 1 MiB each; ordinary JSON responses also have a 1 MiB transport limit. Above that parser, translation orchestration enforces the stricter 256 KiB cumulative output budget per service across all source chunks. Exceeding either layer's limit preserves accepted text and returns an explicit error. Connection and TLS handshake timeouts are 10 seconds each; response headers have 30 seconds. Allow up to 60 seconds for the first body bytes; thereafter cancel only after 30 consecutive seconds without new bytes. Reasoning and heartbeats also reset the idle timer. Continuous output has no overall duration limit. A timeout preserves partial text and reports "生成超时，译文未完成，请重试".
 - `TranslationUpdateMsg.text` always contains cumulative translation text; `streaming=true` means generation is ongoing. The final update has `streaming=false`; on failure it includes both `err` and the text already received. Chunked long text retains completed sections and partial output from the current section.
 - Publish the first nonempty text immediately, then update the native view at most 25 times per second. Always publish a terminal state on completion or failure. State snapshots retain only the latest cumulative result per service. Cancellation settles in-progress snapshots as errors so reapplying state does not leave them showing "生成中".
 - Skeletons last only until the first text arrives. Show "生成中" during generation; enable copy, speech, and naming formats only after successful completion. Disconnection, truncation, and cancellation retain text with an incomplete notice and a retry action. Incremental updates reuse the same card state and control identities, preserving reading position and keyboard focus.
@@ -155,3 +155,15 @@ Passive results do not receive focus, so blur alone cannot dismiss them. Outside
 Space/sleep changes advance workspace generation. Stale transient presentations must be closed semantically: cancel full-text requests, single-card retries, and recognition; clear result identities; and settle view state. Calling Hide alone is insufficient. Pinned bubbles only hide and retain independent requests. Menu actions explicitly restore numbered windows that are still alive and pinned. Restoration updates only the `workspace` presentation boundary and preserves the original `canShow` entry check. When unpinning after restoration and reopening the input panel, an invalid old entry requires acquiring a new entry and revoking other entries still capturing content.
 
 Shared state machines and injected operations are not acceptance tests of real NSWorkspace, AX, SCK, or pasteboard behavior. See `../e2e/README.md` for platform tests and desktop verification entry points.
+
+
+## Translation resource budgets
+
+A complete translation accepts at most 18,000 Unicode characters,
+with at most 256 KiB of cumulative translated UTF-8 text per service. The existing
+1,800-character provider chunks and transport limits still apply. Oversized input
+is rejected explicitly; oversized generated output cancels that service's request
+and keeps its last accepted partial text. Source selections are checked before
+creating a result view, and input-panel submissions preserve the draft on rejection.
+All services share a single split of the source. Streaming updates retain a prefix
+and current chunk separately, concatenating only when the 25 Hz publisher emits.
