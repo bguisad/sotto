@@ -26,19 +26,21 @@
 
 Sotto is a desktop translation utility tailored for Windows. Whether you are reading documentation, writing code, or processing multi-language content, Sotto delivers translation results right beside your active window via selection capture, screen snips, or quick keyboard invocation.
 
-Combining multi-engine streaming comparison, offline screen OCR, non-intrusive selection without clipboard pollution, and instant code identifier formatting, Sotto keeps you focused on your work without window-switching fatigue.
+Combining multi-engine streaming comparison, offline screen OCR, selection with guarded clipboard preservation, and instant code identifier formatting, Sotto keeps you focused on your work without window-switching fatigue.
 
 [Download for Windows](https://github.com/doyuli/sotto/releases/latest) · Choose `amd64` for 64-bit PCs (Intel / AMD) or `arm64` for Windows on ARM devices (e.g. Surface Pro, Snapdragon X).
+
+Experimental macOS 14+ support is available from source for Apple silicon (arm64) only. It runs in the menu bar without a Dock icon, uses Accessibility for selection and ScreenCaptureKit + Vision for local screenshot OCR, and ships no PP-OCR models or ONNX Runtime. Windows models live in `resources/windows/ocr`; MyGo merges them with the architecture-specific runtime DLLs only for Windows builds. Signed Mac releases require the optional release job to be configured and enabled.
 
 ---
 
 ## Features
 
 - ⚡ **Concurrent Multi-Engine Comparison**: Query multiple translation sources at once with progressive streaming results; fold or retry cards independently.
-- 🖱️ **Non-Intrusive Selection**: Reads text via UI Automation (UIA) without copying; fallback simulated copy automatically restores your clipboard without polluting history.
-- 📷 **Offline Dual-Engine OCR**: Snip any screen region to translate locally. Powered by on-device PP-OCR and native WinRT OCR—no images uploaded to the cloud.
+- 🖱️ **Non-Intrusive Selection**: Windows reads text via UI Automation (UIA); Mac uses Accessibility. Guarded simulated copy preserves readable clipboard content. Sotto’s own Windows restore writes carry history exclusion markers; temporary copies made by the source app are outside this guarantee.
+- 📷 **Offline Screen OCR**: Snip any screen region to translate locally. Windows uses on-device PP-OCR and native WinRT OCR; Mac uses Vision. Images stay local.
 - 💻 **Identifier Naming Styles**: One-click copy for English translations into `camelCase`, `PascalCase`, `snake_case`, `CONSTANT_CASE`, or `kebab-case`.
-- 🔒 **Secure Credentials & Zero Telemetry**: Strictly local with no tracking. API keys are safely encrypted in Windows Credential Manager (DPAPI) rather than plain-text configs.
+- 🔒 **Secure Credentials & Zero Telemetry**: Strictly local with no tracking. API keys are safely encrypted in Windows Credential Manager or macOS Keychain rather than plain-text configs.
 - 🎨 **Lightweight & Native**: Pure Go backend (`CGO_ENABLED=0`) with native `mygo/ui` windows; frameless design that respects themes, hides on blur, or pins in place.
 
 ---
@@ -68,12 +70,13 @@ Combining multi-engine streaming comparison, offline screen OCR, non-intrusive s
 
 ## Shortcuts & Quick Guide
 
-| Action | Default Shortcut | Description |
+| Action | Windows Default | Description |
 | --- | --- | --- |
 | **Open Translation Panel** | `Ctrl+Alt+A` | Brings up the translation panel; if already open, focuses it and preserves its contents |
 | **Screen Region Translation (OCR)** | `Ctrl+Alt+S` | Snips any screen area to extract text locally and translate |
 | **Selection Translation** | `Ctrl+Alt+D` | Reads highlighted text in the active app and opens a popup bubble |
 
+- **Mac defaults**: `⌥A` opens the panel, `⌥S` starts OCR, and `⌥D` translates the selection. Customize shortcuts, including Command combinations, in Settings.
 - **In the panel**: Press `Enter` to translate, `Shift+Enter` for a new line, `Esc` to close.
 - **Controls**: Pin (📌) to keep the bubble floating, listen to pronunciation (🔊), fold cards, or retry failed services.
 
@@ -83,8 +86,8 @@ Combining multi-engine streaming comparison, offline screen OCR, non-intrusive s
 
 - **Operating System**: Windows 10 / Windows 11
 - **Architectures**:
-  - 64-bit x86 PC (Intel / AMD): download `sotto-*-windows-amd64-installer.exe`
-  - 64-bit ARM device (e.g. Surface Pro / Snapdragon X): download `sotto-*-windows-arm64-installer.exe`
+  - 64-bit x86 PC (Intel / AMD): download `sotto-setup-<version>-amd64.exe`
+  - 64-bit ARM device (e.g. Surface Pro / Snapdragon X): download `sotto-setup-<version>-arm64.exe`
 
 👉 [Download the latest release on GitHub Releases](https://github.com/doyuli/sotto/releases/latest)
 
@@ -94,6 +97,8 @@ Combining multi-engine streaming comparison, offline screen OCR, non-intrusive s
 
 Requires Go (>= 1.27.3) and Bun. The MyGo module and `mygo-cli` are pinned to 0.8.3.
 
+The root `main.go` embeds the app icon and calls `internal/app.Run`. Application lifecycle, hotkeys, service assembly and entry orchestration live together in `internal/app`; native UI components and platform implementations remain in their existing packages.
+
 ```bash
 bun install                  # Install dependencies
 bun run dev                  # Run the native app (with hot reload)
@@ -101,9 +106,10 @@ CGO_ENABLED=0 go test ./...   # Run unit tests
 bunx mygo vet .              # Check native UI usage
 bun run build                # Build for current architecture
 bun run build:win            # Build for both x64 and arm64
+bun run build:mac            # Build an Apple silicon macOS app (on macOS)
 ```
 
-> Native UI tests use `ui.NewTester`. Windows integration tests and desktop acceptance steps are documented in [e2e/README.md](e2e/README.md).
+> Native UI tests live in `internal/ui/{bubble,settings,snip}` and use `ui.NewTester`. Platform integration tests and desktop acceptance steps are documented in [e2e/README.md](e2e/README.md). The default unit suite skips the opt-in OCR runtime probes and desktop e2e tests.
 
 ---
 
@@ -112,3 +118,5 @@ bun run build:win            # Build for both x64 and arm64
 Thanks to the authors and contributors of [Easydict](https://github.com/tisfeng/Easydict) for inspiring Sotto.
 
 Thanks to [Mygo](https://mygo.egoist.dev/) for the framework that powers Sotto.
+
+Mac selection requires Accessibility permission; screenshots require screen recording permission. See [verification entry points](e2e/README.md) for platform checks and pending desktop acceptance. Explicitly saved shortcuts are preserved; missing values use platform defaults.

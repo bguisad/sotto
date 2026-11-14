@@ -1,6 +1,6 @@
 // Package capture grabs a rectangle of the screen as an image, for the
-// OCR pipeline. Coordinates follow mygo's DIP screen space; the Windows
-// layer converts them to the physical pixels GDI captures in.
+// OCR pipeline. Coordinates follow mygo's logical screen space; platform
+// layers convert the chosen display's local units to capture pixels.
 package capture
 
 import "image"
@@ -13,6 +13,3 @@ func Grab(rect Rect) (image.Image, error) {
 
 // Rect is a rectangle in DIP screen coordinates.
 type Rect struct{ X, Y, W, H int }
-
-// GrabWindow captures a rectangle in the overlay's local DIP coordinates.
-func GrabWindow(hwnd uintptr, rect Rect) (image.Image, error) { return grabWindow(hwnd, rect) }
