@@ -4,8 +4,8 @@
 // focus, and blur, through real Win32 calls. It needs a desktop session
 // and the production build:
 //
-//	bun run build
-//	CGO_ENABLED=0 go test -tags e2e ./e2e/ -v
+//	bun run build:win:x64 -skip-installer
+//	CGO_ENABLED=0 go test -tags e2e,mygo_nowebview ./e2e/ -v
 //
 // What it covers:
 //   - the app comes up with all three hotkeys registered
@@ -29,7 +29,7 @@ import (
 	"unsafe"
 )
 
-const appPath = "../build/windows-amd64/sotto.exe"
+const appPath = "../build/windows-amd64/Sotto.exe"
 
 // start launches the app and waits for its ready log line, which also
 // proves the hotkeys registered.
