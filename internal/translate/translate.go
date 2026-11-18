@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -102,6 +103,13 @@ func Configured(cfg config.Settings, k KeyStore) []string {
 		}
 	}
 	return out
+}
+
+// EnabledProviders follows the configured card order, excluding the dictionary.
+func EnabledProviders(settings config.ServiceSettings) []Translator {
+	return slices.DeleteFunc(orderTranslators(DefaultTranslators(), settings.Order), func(service Translator) bool {
+		return service.Name() == "dictionary" || !contains(settings.Enabled, service.Name())
+	})
 }
 
 // Test checks a fixed, non-streaming translation, including disabled services.
@@ -355,6 +363,8 @@ func orderTranslators(all []Translator, order []string) []Translator {
 func UserMessage(err error) string {
 	var networkErr *url.Error
 	switch {
+	case errors.Is(err, ErrEmptySource):
+		return "清理后的原文为空，请修改原文或调整命名转换设置。"
 	case errors.Is(err, ErrInputLimit):
 		return "原文过长，单次最多翻译 18000 个字符，请分次提交"
 	case errors.Is(err, ErrResultLimit):

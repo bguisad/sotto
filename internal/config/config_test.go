@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -252,8 +253,39 @@ func TestNormalizePartialFile(t *testing.T) {
 	if got.AutoUpdate {
 		t.Error("legacy settings should keep automatic updates off")
 	}
+	if got.MinimalTranslation {
+		t.Error("legacy settings should use the full translation bubble")
+	}
 	if got.Services.SiliconFlow.Model != DefaultSiliconFlowModel || got.Services.Zhipu.Model != DefaultZhipuModel {
 		t.Errorf("legacy settings lost model defaults: %+v", got.Services)
+	}
+}
+
+func TestMinimalTranslationRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	cfg := Default()
+	for _, on := range []bool{true, false} {
+		cfg.MinimalTranslation = on
+		if err := Save(path, cfg); err != nil {
+			t.Fatal(err)
+		}
+		reloaded, err := Load(path)
+		if err != nil || reloaded.MinimalTranslation != on {
+			t.Fatalf("reloaded mode = %v, want %v, err=%v", reloaded.MinimalTranslation, on, err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stored struct {
+			Enabled *bool `json:"minimalTranslation"`
+		}
+		if err := json.Unmarshal(data, &stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored.Enabled == nil || *stored.Enabled != on {
+			t.Fatalf("saved settings should contain minimalTranslation=%v", on)
+		}
 	}
 }
 

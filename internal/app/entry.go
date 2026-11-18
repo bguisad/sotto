@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 
+	"github.com/egoist/mygo"
+
 	"sotto/internal/platform"
 )
 
@@ -20,6 +22,8 @@ type entryTask struct {
 	cancel    context.CancelFunc
 	gate      *entryGate
 	workspace uint64
+	minimal   bool
+	cursor    mygo.Point
 }
 
 func (g *entryGate) begin() *entryTask {
@@ -46,6 +50,18 @@ func (g *entryGate) cancel() {
 	if g.current != nil {
 		g.current.cancel()
 	}
+}
+
+func (g *entryGate) cancelMinimal() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.current != nil && g.current.minimal {
+		g.current.cancel()
+	}
+}
+
+func (t *entryTask) source() mygo.Rectangle {
+	return mygo.Rectangle{X: t.cursor.X, Y: t.cursor.Y}
 }
 
 // A workspace notification can arrive after a hotkey in the new workspace.

@@ -20,10 +20,6 @@
   <img src="https://img.shields.io/badge/Privacy-Zero%20Telemetry-success" alt="Zero Telemetry">
 </p>
 
-<p align="center">
-  <img src="docs/banner.png" width="100%" alt="Sotto interface preview">
-</p>
-
 ---
 
 ## Why Sotto?
@@ -36,12 +32,19 @@ When reading documentation, researching foreign language resources, or coding, c
 
 ## Features
 
+- **Flexible Modes**: Enable **Minimal Translation Mode** in Settings to keep selection and snip results text-only, while the panel shortcut remains ready to summon the full Bubble view.
 - **Concurrent Multi-Engine Comparison**: Query multiple translation sources at once with progressive streaming results; fold, copy, or retry cards independently.
 - **Non-Intrusive Selection & Clipboard Protection**: Windows reads text via UIA and macOS via Accessibility without stealing focus; simulated copy automatically and fully restores the clipboard with history exclusion markers attached.
 - **Offline Screen OCR**: Snip any screen region for instant local recognition and translation; Windows embeds PP-OCR and WinRT OCR, macOS uses native Vision, and images are never uploaded to the cloud.
 - **Identifier Naming Styles**: One-click copy for English translations into `camelCase`, `PascalCase`, `snake_case`, `CONSTANT_CASE`, or `kebab-case`.
 - **Credential Protection & Zero Telemetry**: Zero tracking, with API keys protected by the system credential manager or keychain.
 - **Lightweight & Native**: Pure Go backend (`CGO_ENABLED=0`) with native `mygo/ui` windows; frameless design that respects system themes, hides on blur, or pins in place.
+
+> **Bubble vs Minimal**: Sotto offers two complementary ways to view translations, balancing multi-engine comparison with distraction-free reading.
+
+<p align="center">
+  <img src="docs/modes-preview.png" width="100%" alt="Sotto Bubble Mode and Minimal Translation Mode preview">
+</p>
 
 ---
 
@@ -55,10 +58,9 @@ Sotto provides three instant entry points with fully customizable global shortcu
 | **Screen Snip Translation (OCR)** | `Ctrl + Alt + S` | `⌥ Option + S` | Snips any screen area to extract text locally and query translation engines |
 | **Selection Translation** | `Ctrl + Alt + D` | `⌥ Option + D` | Reads highlighted text in the frontmost app and shows a popup bubble beside it |
 
-### In-Bubble Controls
-- **Keyboard navigation**: Press `Enter` to translate, `Shift + Enter` for a newline, and `Esc` to dismiss the bubble.
-- **Floating controls**: Click the pin icon to keep the bubble open on blur; native text-to-speech pronunciation for source and translated text.
-- **Card management**: Fold or expand individual engine cards, and retry any card that encounters an error.
+### Interactive Controls
+- **Bubble Mode**: Press `Enter` to translate, `Shift + Enter` for a newline, and `Esc` to close; click the pin icon to stay open on blur; play native TTS for source and translated text, and fold or retry individual cards.
+- **Minimal Translation Mode**: Shows selection and snip translations in independent floating overlays beside the target region; drag anywhere to reposition, scroll smoothly through long text, and press `Esc` or right-click to close—while the input panel shortcut still opens the full bubble anytime.
 
 ---
 
