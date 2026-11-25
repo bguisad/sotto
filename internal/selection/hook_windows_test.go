@@ -76,6 +76,13 @@ func TestWindowContainsNativePopup(t *testing.T) {
 }
 
 func TestForegroundHookFiltersWindows(t *testing.T) {
+	// A foreground event can reach the app after the left button is released.
+	// It still needs the press captured by the mouse hook.
+	previousPress := lastPrimaryMousePress.Swap(nil)
+	t.Cleanup(func() { lastPrimaryMousePress.Store(previousPress) })
+	first := PrimaryPress{At: time.Unix(0, 0)}
+	second := PrimaryPress{At: first.At.Add(time.Millisecond)}
+	first.Point.X, second.Point.X = 40, 120
 	window := newHookTestWindow(t)
 	const wsPopup, wsChild = 0x80000000, 0x40000000
 	host := window(0, wsPopup)
@@ -105,16 +112,35 @@ func TestForegroundHookFiltersWindows(t *testing.T) {
 				previous, _ := watch.outside.Load().([]*windowLeaveWatch)
 				defer watch.outside.Store(previous)
 				var got [2]int
+				var primary [2]PrimaryPress
+				finish := make(chan struct{})
 				watch.outside.Store([]*windowLeaveWatch{
-					{hwnd: bubble, changed: func() { got[0]++ }},
-					{hwnd: other, changed: func() { got[1]++ }},
+					{hwnd: bubble, changed: func(press PrimaryPress) {
+						<-finish
+						got[0]++
+						primary[0] = press
+					}},
+					{hwnd: other, changed: func(press PrimaryPress) {
+						<-finish
+						got[1]++
+						primary[1] = press
+					}},
 				})
+				lastPrimaryMousePress.Store(&first)
 				foregroundHookProc(0, tt.event, tt.hwnd, 0, 0, 0, 0)
+				// A new press must not replace the one attached to queued work.
+				lastPrimaryMousePress.Store(&second)
+				close(finish)
 				// Wait for dispatched goroutines without sleeps, including when
 				// no callback should have been scheduled for an owned window.
 				synctest.Wait()
 				if got != tt.want {
 					t.Errorf("foreground notifications = %v, want %v", got, tt.want)
+				}
+				for i, count := range got {
+					if count != 0 && primary[i] != first {
+						t.Errorf("notification %d press = %+v, want %+v", i, primary[i], first)
+					}
 				}
 			})
 		})
@@ -128,7 +154,7 @@ func TestWatchWindowLeaveForegroundNotifications(t *testing.T) {
 	other := window(0, wsPopup)
 	notify := modUser32.NewProc("NotifyWinEvent")
 	changes := make(chan struct{}, 1)
-	stop, err := WatchWindowLeave(bubble, func() {
+	stop, err := WatchWindowLeave(bubble, func(PrimaryPress) {
 		select {
 		case changes <- struct{}{}:
 		default:
@@ -150,7 +176,7 @@ func TestWatchWindowLeaveForegroundNotifications(t *testing.T) {
 
 	// Removing one bubble must not stop another bubble's foreground hook.
 	second := make(chan struct{}, 1)
-	stopSecond, err := WatchWindowLeave(other, func() {
+	stopSecond, err := WatchWindowLeave(other, func(PrimaryPress) {
 		select {
 		case second <- struct{}{}:
 		default:

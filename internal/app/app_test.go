@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -55,6 +56,54 @@ func TestOpenAtLoginSurvivesQueuedSettingsSave(t *testing.T) {
 	if err := a.commitOpenAtLogin(true, apply); err != nil || !slices.Equal(applied, []bool{true, true}) {
 		t.Fatalf("login item updates=%v err=%v", applied, err)
 	}
+}
+
+func TestPresentSettingsWindowFitsAfterRestore(t *testing.T) {
+	// On Windows, fitting before Focus used to skip the minimized window's first reopen.
+	saved := mygo.Rectangle{X: 100, Y: 160, Width: 780, Height: 600}
+	work := mygo.Rectangle{X: -700, Y: 30, Width: 700, Height: 540}
+	for _, tc := range []struct {
+		name                             string
+		minimized, maximized, fullScreen bool
+		want                             mygo.Rectangle
+	}{
+		{"minimized on another display", true, false, false, work},
+		{"minimized from maximized", true, true, false, saved},
+		{"already maximized", false, true, false, saved},
+		{"full screen", false, false, true, saved},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &testSettingsWindow{bounds: saved, minimized: tc.minimized, maximized: tc.maximized, fullScreen: tc.fullScreen}
+			presentSettingsWindow(w, work)
+			if !w.focused || w.minimized || w.maximized != tc.maximized || w.fullScreen != tc.fullScreen || w.presented != tc.want {
+				t.Fatalf("window state after open = %+v, want focused window with presented bounds %+v", w, tc.want)
+			}
+		})
+	}
+}
+
+type testSettingsWindow struct {
+	bounds, presented                mygo.Rectangle
+	minimized, maximized, fullScreen bool
+	focused                          bool
+}
+
+func (w *testSettingsWindow) IsMinimized() bool  { return w.minimized }
+func (w *testSettingsWindow) IsMaximized() bool  { return w.maximized }
+func (w *testSettingsWindow) IsFullScreen() bool { return w.fullScreen }
+func (w *testSettingsWindow) Bounds() mygo.Rectangle {
+	if w.minimized {
+		return mygo.Rectangle{X: -32000, Y: -32000, Width: 160, Height: 24}
+	}
+	return w.bounds
+}
+func (*testSettingsWindow) SetMinimumSize(int, int)      {}
+func (w *testSettingsWindow) SetBounds(r mygo.Rectangle) { w.bounds = r }
+func (w *testSettingsWindow) Restore()                   { w.minimized = false }
+func (w *testSettingsWindow) Show()                      { w.presented = w.Bounds() }
+func (w *testSettingsWindow) Focus() {
+	w.Restore()
+	w.focused = true
 }
 
 func TestPrepareTranslationRequestCleansAndValidatesSource(t *testing.T) {
@@ -120,5 +169,81 @@ func TestSelectionPlacementUsesCapturedSource(t *testing.T) {
 	sel := selection.Selection{HasRect: true, Rect: selection.Rect{X: 10, Y: 12, W: 40, H: 18}}
 	if got := task.selectionSource(sel); got != (mygo.Rectangle{X: 10, Y: 12, Width: 40, Height: 18}) {
 		t.Fatalf("selection bounds lost: %+v", got)
+	}
+}
+
+func TestTrayAutoDismissSuppression(t *testing.T) {
+	// A tray mouse-down can dismiss the window before mouse-up reaches OnClick.
+	trayBounds := mygo.Rectangle{X: 1180, Y: 0, Width: 28, Height: 24}
+	inside := mygo.Point{X: 1192, Y: 12}
+	dismissedAt := time.Unix(0, 0)
+	press := selection.PrimaryPress{At: dismissedAt, Point: inside}
+	for _, tc := range []struct {
+		name    string
+		action  string
+		elapsed time.Duration
+		point   mygo.Point
+		bounds  mygo.Rectangle
+		want    bool
+	}{
+		{"tray press", config.TrayActionHistory, 150 * time.Millisecond, inside, trayBounds, true},
+		{"outside press next to tray", config.TrayActionHistory, 150 * time.Millisecond, mygo.Point{X: trayBounds.X + trayBounds.Width, Y: inside.Y}, trayBounds, false},
+		{"different action", config.TrayActionPanel, 150 * time.Millisecond, inside, trayBounds, false},
+		{"expired dismissal", config.TrayActionHistory, trayAutoDismissWindow + time.Millisecond, inside, trayBounds, false},
+		{"tray bounds unavailable", config.TrayActionHistory, 150 * time.Millisecond, mygo.Point{}, mygo.Rectangle{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &application{cfg: config.Settings{TrayClickAction: config.TrayActionHistory}}
+			a.recordTrayAutoDismiss(config.TrayActionHistory, selection.PrimaryPress{At: dismissedAt, Point: tc.point})
+			now := dismissedAt.Add(tc.elapsed)
+			bounds := func() mygo.Rectangle { return tc.bounds }
+			if got := a.consumeTrayAutoDismissAt(tc.action, now, bounds); got != tc.want {
+				t.Fatalf("suppress reopening = %t, want %t", got, tc.want)
+			}
+			if a.consumeTrayAutoDismissAt(tc.action, now, bounds) {
+				t.Fatal("a dismissal should suppress reopening only once")
+			}
+		})
+	}
+
+	a := &application{cfg: config.Settings{TrayClickAction: config.TrayActionHistory}}
+	a.recordTrayAutoDismiss(config.TrayActionHistory, press)
+	a.popUpTrayMenu()
+	if a.consumeTrayAutoDismissAt(config.TrayActionHistory, dismissedAt, func() mygo.Rectangle { return trayBounds }) {
+		t.Fatal("opening the tray menu should clear a pending dismissal")
+	}
+}
+
+func TestTrayMenuDoesNotReopenAfterNativeDismissal(t *testing.T) {
+	// The popup can close before the left-click callback arrives, even when opened by right-click.
+	a := &application{cfg: config.Settings{TrayClickAction: config.TrayActionMenu}}
+	press := selection.PrimaryPress{At: time.Unix(0, 0), Point: mygo.Point{X: 1200, Y: 12}}
+	a.recordTrayAutoDismiss(config.TrayActionMenu, press)
+	bounds := func() mygo.Rectangle { return mygo.Rectangle{X: 1196, Y: 8, Width: 9, Height: 9} }
+	now := press.At.Add(150 * time.Millisecond)
+	if !a.consumeTrayAutoDismissAt(config.TrayActionMenu, now, bounds) {
+		t.Fatal("the click that closed the menu reopened it")
+	}
+	if a.consumeTrayAutoDismissAt(config.TrayActionMenu, now, bounds) {
+		t.Fatal("the next click should open the menu")
+	}
+}
+
+func TestTrayMenuToggleHandlesNativeReentry(t *testing.T) {
+	// Windows can deliver the second tray click while the first popup is tracking.
+	a := &application{}
+	opened, closed := 0, 0
+	show := func() { opened++ }
+	closeMenu := func() { closed++ }
+	a.toggleTrayMenu(func() {
+		show()
+		a.toggleTrayMenu(show, closeMenu)
+	}, closeMenu)
+	if opened != 1 || closed != 1 {
+		t.Fatalf("after two clicks: opened=%d closed=%d, want 1 each", opened, closed)
+	}
+	a.toggleTrayMenu(show, closeMenu)
+	if opened != 2 || closed != 1 {
+		t.Fatalf("after three clicks: opened=%d closed=%d, want 2 and 1", opened, closed)
 	}
 }

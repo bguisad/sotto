@@ -10,8 +10,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
+	"github.com/egoist/mygo"
 	"golang.org/x/sys/windows"
 )
 
@@ -66,6 +68,8 @@ var (
 	procGetWindow               = modUser32.NewProc("GetWindow")
 	procSetWinEventHook         = modUser32.NewProc("SetWinEventHook")
 	procUnhookWinEvent          = modUser32.NewProc("UnhookWinEvent")
+	procGetPhysicalCursorPos    = modUser32.NewProc("GetPhysicalCursorPos")
+	procGetSystemMetrics        = modUser32.NewProc("GetSystemMetrics")
 )
 
 // windowHooks shares mouse and foreground hooks across visible bubbles.
@@ -80,10 +84,40 @@ type windowHooks struct {
 
 type windowLeaveWatch struct {
 	hwnd    uintptr
-	changed func()
+	changed func(PrimaryPress)
 }
 
 var watch windowHooks
+
+var lastPrimaryMousePress atomic.Pointer[PrimaryPress]
+
+// WatchPrimaryMousePresses keeps the shared hook installed while the native
+// tray menu is open, when there may be no window to watch for focus changes.
+func WatchPrimaryMousePresses() (func(), error) { return WatchWindowLeave(0, nil) }
+
+// CapturePrimaryPress can outlive the release: Windows can deliver blur after
+// mouse-up. Keep the same snapshot until the queued dismissal uses it.
+func CapturePrimaryPress() PrimaryPress {
+	if press := lastPrimaryMousePress.Load(); press != nil {
+		return *press
+	}
+	return PrimaryPress{}
+}
+
+func ClearPrimaryMousePress() { lastPrimaryMousePress.Store(nil) }
+
+// CursorDragBounds uses the same physical pixels as the mouse hook. The shell
+// click already identifies the tray icon, including when it is in overflow.
+func CursorDragBounds() mygo.Rectangle {
+	var cursor struct{ X, Y int32 }
+	if ok, _, _ := procGetPhysicalCursorPos.Call(uintptr(unsafe.Pointer(&cursor))); ok == 0 {
+		return mygo.Rectangle{}
+	}
+	const smCXDrag, smCYDrag = 68, 69
+	x, _, _ := procGetSystemMetrics.Call(smCXDrag)
+	y, _, _ := procGetSystemMetrics.Call(smCYDrag)
+	return mygo.Rectangle{X: int(cursor.X) - int(x), Y: int(cursor.Y) - int(y), Width: 2*int(x) + 1, Height: 2*int(y) + 1}
+}
 
 // startMu serializes starts and stops, so two racing starts cannot
 // install duplicate hooks; mu stays for the hook thread's state access.
@@ -92,7 +126,7 @@ var startMu sync.Mutex
 // WatchWindowLeave calls changed on a goroutine after outside presses and
 // foreground changes. The caller rechecks current focus, including owned popups,
 // and guards any in-flight callback after unregistering.
-func WatchWindowLeave(hwnd uintptr, changed func()) (stop func(), err error) {
+func WatchWindowLeave(hwnd uintptr, changed func(PrimaryPress)) (stop func(), err error) {
 	startMu.Lock()
 	defer startMu.Unlock()
 	if err := ensureWindowHooks(); err != nil {
@@ -200,11 +234,12 @@ func foregroundHookProc(hook, event, hwnd, object, child, thread, timestamp uint
 		return 0
 	}
 	outside, _ := watch.outside.Load().([]*windowLeaveWatch)
+	press := CapturePrimaryPress()
 	for _, w := range outside {
 		// Avoid dispatching internal activation changes. The caller still
 		// rechecks live focus because this event may already be stale.
-		if !windowContains(w.hwnd, hwnd) {
-			go w.changed()
+		if w.changed != nil && !windowContains(w.hwnd, hwnd) {
+			go w.changed(press)
 		}
 	}
 	return 0
@@ -218,7 +253,18 @@ func mouseHookProc(code int, wparam uintptr, lparam uintptr) uintptr {
 		case wmLButtonDown, wmRButtonDown, wmMButtonDown, wmXButtonDown:
 			h := (*msllHookStruct)(native(lparam))
 			if outside, _ := watch.outside.Load().([]*windowLeaveWatch); len(outside) != 0 {
-				go notifyOutside(outside, h.X, h.Y)
+				var press PrimaryPress
+				if wparam == wmLButtonDown {
+					press = PrimaryPress{At: time.Now(), Point: mygo.Point{X: int(h.X), Y: int(h.Y)}}
+					lastPrimaryMousePress.Store(&press)
+				}
+				// A menu-only watch just needs the press and has no window to hit-test.
+				for _, w := range outside {
+					if w.changed != nil {
+						go notifyOutside(outside, h.X, h.Y, press)
+						break
+					}
+				}
 			}
 		}
 	}
@@ -226,14 +272,14 @@ func mouseHookProc(code int, wparam uintptr, lparam uintptr) uintptr {
 	return r
 }
 
-func notifyOutside(watches []*windowLeaveWatch, x, y int32) {
+func notifyOutside(watches []*windowLeaveWatch, x, y int32, press PrimaryPress) {
 	// The hook reports physical screen pixels. Resolve the child surface
 	// to its top-level window before deciding whether the click is outside.
 	point := uint64(uint32(x)) | uint64(uint32(y))<<32
 	hit, _, _ := procWindowFromPhysicalPoint.Call(uintptr(point))
 	for _, w := range watches {
-		if !windowContains(w.hwnd, hit) {
-			w.changed()
+		if w.changed != nil && !windowContains(w.hwnd, hit) {
+			w.changed(press)
 		}
 	}
 }

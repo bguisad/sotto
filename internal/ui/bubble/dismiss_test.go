@@ -4,10 +4,12 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo"
 
 	"sotto/internal/config"
+	"sotto/internal/selection"
 )
 
 func newDismissTestBubble(t *testing.T, trigger, phase string) (*Manager, *bubble) {
@@ -388,6 +390,40 @@ func TestPinnedRestoreRejectsObsoleteMenuActions(t *testing.T) {
 			}
 			if m.claimPinnedRestore(b, 1) || b.workspace != 0 {
 				t.Fatal("obsolete menu action renewed presentation")
+			}
+		})
+	}
+}
+
+func TestCommitTransientBubbleHideOnlyNotifiesInputAutoHide(t *testing.T) {
+	// Keyboard blur must not mark the next tray click as a mouse dismissal.
+	for _, tc := range []struct {
+		name         string
+		trigger      string
+		primaryPress bool
+		wantCalls    int
+	}{
+		{"input left-click dismissal", "input", true, 1},
+		{"input keyboard or right-click dismissal", "input", false, 0},
+		{"selection left-click dismissal", "selection", true, 0},
+		{"ocr left-click dismissal", "ocr", true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, b := newDismissTestBubble(t, tc.trigger, "")
+			calls, hidden := 0, 0
+			var press selection.PrimaryPress
+			if tc.primaryPress {
+				press = selection.PrimaryPress{At: time.Unix(0, 0), Point: mygo.Point{X: 10, Y: 20}}
+			}
+			m.actions.OnInputAutoHide = func(got selection.PrimaryPress) {
+				calls++
+				if got != press {
+					t.Errorf("dismissal press = %+v, want %+v", got, press)
+				}
+			}
+			m.commitTransientBubbleHide(b, press, func(*bubbleView, RunStoppedMsg) { hidden++ })
+			if hidden != 1 || calls != tc.wantCalls {
+				t.Fatalf("hidden=%d OnInputAutoHide calls=%d, want hidden=1 calls=%d", hidden, calls, tc.wantCalls)
 			}
 		})
 	}
