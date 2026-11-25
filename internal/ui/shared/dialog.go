@@ -42,7 +42,7 @@ func ConfirmDialog(c *ui.Context, open *bool, opts ConfirmDialogOptions) ui.Elem
 			Width(panelW).
 			MaxHeight(max(float32(160), h-40)).
 			Padding(20, 22).
-			Radius(8).
+			Radius(10).
 			Background(colors.Panel).
 			Border(1, colors.Border).
 			Shadow(0, 10, 28, 0, ui.RGBA(0, 0, 0, shadowAlpha))
@@ -54,13 +54,14 @@ func ConfirmDialog(c *ui.Context, open *bool, opts ConfirmDialogOptions) ui.Elem
 			})
 
 			ui.Row(c).FillWidth().Justify(ui.End).AlignItems(ui.Center).Gap(8).Children(func() {
-				ui.Button(c, opts.CancelLabel).AutoFocus().Radius(4).Cursor(ui.CursorPointer).OnClick(func() {
+				style := dialogButtonStyle(colors)
+				dialogButton(c.Key("cancel"), opts.CancelLabel, true, style, func() {
 					*open = false
 					if opts.OnCancel != nil {
 						opts.OnCancel()
 					}
 				})
-				ui.Button(c, opts.ConfirmLabel).Radius(4).Cursor(ui.CursorPointer).OnClick(func() {
+				dialogButton(c.Key("confirm"), opts.ConfirmLabel, false, style, func() {
 					*open = false
 					if opts.OnConfirm != nil {
 						opts.OnConfirm()
@@ -74,4 +75,63 @@ func ConfirmDialog(c *ui.Context, open *bool, opts ConfirmDialogOptions) ui.Elem
 		opts.OnCancel()
 	}
 	return dialog
+}
+
+// GrayscaleSurface nudges fully opaque colors 1/255 below full alpha so MyGo
+// uses grayscale text antialiasing instead of ClearType RGB subpixel fringes
+// on 100%-DPI Windows CJK text when ancestor surfaces are also below 255.
+func GrayscaleSurface(c ui.Color) ui.Color {
+	if c.A == 255 {
+		c.A = 254
+	}
+	return c
+}
+
+type buttonColors struct {
+	bg, hover, pressed, border, text ui.Color
+}
+
+func dialogButtonStyle(colors ConfirmDialogColors) buttonColors {
+	if colors.Dark {
+		return buttonColors{
+			bg:      GrayscaleSurface(ui.Hex("#2c2d30")),
+			hover:   GrayscaleSurface(ui.Hex("#35373b")),
+			pressed: GrayscaleSurface(ui.Hex("#3e4046")),
+			border:  ui.Hex("#3a3c42"),
+			text:    colors.Text,
+		}
+	}
+	return buttonColors{
+		bg:      GrayscaleSurface(ui.Hex("#f3f4f6")),
+		hover:   GrayscaleSurface(ui.Hex("#ebedf0")),
+		pressed: GrayscaleSurface(ui.Hex("#e2e5ea")),
+		border:  ui.Hex("#e2e5ea"),
+		text:    colors.Text,
+	}
+}
+
+func dialogButton(c *ui.Context, label string, autoFocus bool, style buttonColors, onClick func()) {
+	btn := ui.ButtonBase(c).
+		Label(label).
+		Radius(7).
+		MinHeight(30).
+		Padding(0, 14).
+		Border(1, style.border).
+		FocusRing(true).
+		Cursor(ui.CursorPointer)
+	if autoFocus {
+		btn.AutoFocus()
+	}
+	bg := style.bg
+	switch {
+	case btn.Pressed():
+		bg = style.pressed
+	case btn.Hovered():
+		bg = style.hover
+	}
+	btn.Background(bg).OnClick(onClick)
+	btn.Children(func() {
+		// 1 DIP bottom padding balances DirectWrite YaHei upper headroom on Windows.
+		ui.Text(c, label).FontSize(13).TextColor(style.text).SingleLine().Padding(0, 0, 1, 0)
+	})
 }
