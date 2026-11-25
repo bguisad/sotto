@@ -15,6 +15,7 @@ import (
 	"github.com/egoist/mygo/ui"
 
 	"sotto/internal/config"
+	"sotto/internal/history"
 	"sotto/internal/hotkey"
 	"sotto/internal/keys"
 	"sotto/internal/langdetect"
@@ -34,8 +35,9 @@ import (
 // the bubble windows and the settings window. Its mutex guards the
 // fields and is never held across a call that waits for the main thread.
 type application struct {
-	cfgPath       string
-	configWriteMu sync.Mutex
+	cfgPath          string
+	fallbackSettings bool // fixed at startup; the session cannot persist history preferences
+	configWriteMu    sync.Mutex
 
 	mu              sync.Mutex
 	cfg             config.Settings
@@ -45,9 +47,17 @@ type application struct {
 	entry           entryGate
 	settingsWin     *mygo.Window
 	settingsView    *settings.View
+	history         *history.Store
+	historyCtx      context.Context
+	stopHistory     context.CancelFunc
+	historyWin      *mygo.Window         // main thread only
+	focusHistory    func(mygo.Rectangle) // main thread only
+	refreshHistory  func()               // main thread only
+	dismissHistory  func()               // main thread only
 	quitting        bool
 
 	bubbles     *bubble.Manager
+	speaker     *speech.Speaker
 	overlays    overlay.Manager
 	minimalJobs map[int64]*minimalJob // main thread only
 	snip        *snip.Manager
@@ -72,18 +82,22 @@ func (a *application) isQuitting() bool {
 // ready assembles the app once mygo is up: settings, bubbles, hotkeys
 // and the tray. It runs on the main thread.
 func (a *application) ready() {
-	dir, err := mygo.App.Path(mygo.PathUserData)
-	if err != nil {
-		log.Printf("user data path: %v", err)
+	dir, pathErr := mygo.App.Path(mygo.PathUserData)
+	if pathErr != nil {
+		log.Printf("user data path: %v", pathErr)
 		dir = "."
 	}
 	a.cfgPath = filepath.Join(dir, "settings.json")
 	cfg, err := config.Load(a.cfgPath)
 	if err != nil {
 		log.Printf("settings: %v", err)
+		// Keep fallback settings writes away from the unread user-data file.
+		a.cfgPath = "settings.json"
 	}
+	a.fallbackSettings = pathErr != nil || err != nil
 	cfg.Hotkeys = canonicalHotkeys(cfg.Hotkeys)
 	a.cfg = cfg
+	a.startHistory(cfg.History)
 
 	// Restore checks without overwriting choices made in the update window.
 	platform.SetAutomaticUpdates(cfg.AutoUpdate)
@@ -109,10 +123,10 @@ func (a *application) ready() {
 			e.PreventDefault()
 		}
 	})
-	speaker := speech.New()
-	mygo.App.OnQuit(speaker.Close)
+	a.speaker = speech.New()
+	mygo.App.OnQuit(a.speaker.Close)
 	a.bubbles = bubble.NewManager(a.isQuitting, bubble.Actions{
-		Speak:        speaker.Speak,
+		Speak:        a.speaker.Speak,
 		Run:          a.runTranslation,
 		Settings:     a.settings,
 		StartOCR:     func() { a.startEntry("ocr") },
@@ -145,8 +159,7 @@ func (a *application) settings() config.Settings {
 	return a.cfg
 }
 
-// A queued form snapshot may predate a shortcut or tray change. Those two
-// preferences are committed independently against the latest settings.
+// Ordinary form saves must not overwrite preferences committed independently.
 func (a *application) updateSettings(s config.Settings) error {
 	a.configWriteMu.Lock()
 	defer a.configWriteMu.Unlock()
@@ -154,6 +167,8 @@ func (a *application) updateSettings(s config.Settings) error {
 	current := a.settings()
 	s.MinimalTranslation = current.MinimalTranslation
 	s.OpenAtLogin = current.OpenAtLogin
+	s.History = current.History
+	s.Hotkeys = current.Hotkeys
 	return a.saveSettings(config.Normalize(s))
 }
 
@@ -361,6 +376,7 @@ func (a *application) trayTranslationItems() []*mygo.MenuItem {
 	a.mu.Lock()
 	panelKey, ocrKey, selectionKey := a.hotkeys["panel"], a.hotkeys["ocr"], a.hotkeys["selection"]
 	modeKey, minimal := a.hotkeys["minimalTranslation"], a.cfg.MinimalTranslation
+	historyKey := a.hotkeys["history"]
 	a.mu.Unlock()
 
 	// Hint at the shortcut without taking focus from the source application.
@@ -377,6 +393,9 @@ func (a *application) trayTranslationItems() []*mygo.MenuItem {
 			a.startEntry("ocr")
 		}},
 		selectionHint,
+		{ID: "history", Label: hotkeyLabels["history"], Accelerator: historyKey, Click: func(*mygo.MenuItem, *mygo.Window) {
+			a.showHistory()
+		}},
 		mygo.Separator(),
 		{ID: "minimalTranslation", Label: hotkeyLabels["minimalTranslation"], Accelerator: modeKey,
 			Type: mygo.MenuItemCheckbox, Checked: minimal, Click: func(*mygo.MenuItem, *mygo.Window) {
@@ -472,6 +491,8 @@ func (a *application) createSettingsView(tab settings.Tab) *settings.View {
 		GetSettings:            svc.Get,
 		SaveSettings:           svc.Set,
 		SaveMinimalTranslation: a.setMinimalTranslation,
+		SaveHistory:            a.updateHistorySettings,
+		ClearHistory:           func() error { return a.history.Clear(context.Background()) },
 		ReadOpenAtLogin:        mygo.App.OpenAtLogin,
 		SaveOpenAtLogin:        a.setOpenAtLogin,
 		Credentials:            svc.Credentials,
@@ -526,8 +547,10 @@ func (a *application) runTranslation(win *mygo.Window, req bubble.RunReq) {
 		}
 		return
 	}
+	record := a.beginHistory(req.Text, request, cfg.Services.Order)
 	credentials, err := a.translationCredentials(ctx, &cfg.Services, req.Service)
 	if err != nil {
+		record.Done()
 		a.bubbles.FinishRun(win, req.ReqID)
 		return
 	}
@@ -540,29 +563,43 @@ func (a *application) runTranslation(win *mygo.Window, req bubble.RunReq) {
 	}
 	meta := bubble.RunMetaMsg{ReqID: req.ReqID, SourceLang: request.SourceLang, TargetLang: request.TargetLang, Services: services}
 	if !a.bubbles.PushMeta(win, meta, req.Service) {
+		record.Done()
 		a.bubbles.FinishRun(win, req.ReqID)
 		return
 	}
 	if req.Service != "" && !slices.Contains(services, req.Service) {
+		record.Done()
 		msg := bubble.TranslationUpdateMsg{ReqID: req.ReqID, Service: req.Service, Err: "该服务当前不可用，请检查设置"}
 		a.bubbles.PushResult(win, msg)
 		a.bubbles.FinishRun(win, req.ReqID)
 		return
 	}
 	go func() {
+		var writes sync.WaitGroup
+		defer record.Done()
+		defer writes.Wait() // release the request only after its accepted writes finish
 		defer a.bubbles.FinishRun(win, req.ReqID)
-		emit := func(res translate.Result) {
-			if ctx.Err() != nil {
-				return
-			}
-			msg := bubble.TranslationUpdateMsg{
-				ReqID: req.ReqID, Service: res.Service, Text: res.Text, DetectedLang: res.DetectedLang,
-				Err: res.Err, Streaming: res.Streaming, Dictionary: res.Dictionary,
-			}
-			a.bubbles.PushResult(win, msg)
-		}
+		emit := a.bubbleResultHandler(ctx, record, &writes, req.ReqID, func(msg bubble.TranslationUpdateMsg) bool {
+			return a.bubbles.PushResult(win, msg)
+		})
 		translate.Run(ctx, cfg, credentials, request, emit)
 	}()
+}
+
+func (a *application) bubbleResultHandler(ctx context.Context, record *history.Request, writes *sync.WaitGroup, reqID string, push func(bubble.TranslationUpdateMsg) bool) func(translate.Result) {
+	return func(res translate.Result) {
+		if ctx.Err() != nil {
+			return
+		}
+		accepted := push(bubble.TranslationUpdateMsg{
+			ReqID: reqID, Service: res.Service, Text: res.Text, DetectedLang: res.DetectedLang,
+			Err: res.Err, Streaming: res.Streaming, Dictionary: res.Dictionary,
+		})
+		if accepted && record != nil && !res.Streaming && res.Err == "" {
+			// Once accepted, dismissing the bubble no longer owns the history write.
+			writes.Go(func() { a.recordTranslation(context.WithoutCancel(ctx), record, res) })
+		}
+	}
 }
 
 func prepareTranslationRequest(text, source, target string, cfg config.Settings) (translate.Request, error) {
