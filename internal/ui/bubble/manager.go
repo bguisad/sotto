@@ -3,7 +3,6 @@ package bubble
 import (
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"runtime"
@@ -114,7 +113,7 @@ func (m *Manager) FocusVisibleInput() bool {
 	reuse := m.transient == b && m.byID[b.id] == b && b.refocusInput(visible)
 	var presented BubblePresentedMsg
 	if reuse {
-		presented = BubblePresentedMsg{ClipboardRecoveryID: selection.PendingClipboardRecovery(), SessionID: b.sessionID, ShowID: b.showID, Revision: b.revision, Focus: true}
+		presented = BubblePresentedMsg{SessionID: b.sessionID, ShowID: b.showID, Revision: b.revision, Focus: true}
 	}
 	m.mu.Unlock()
 	if !reuse {
@@ -391,22 +390,21 @@ func (m *Manager) ApplySettings(s config.Settings) {
 
 func (m *Manager) state(b *bubble, cfg config.Settings) BubbleState {
 	return BubbleState{
-		ID:                  b.id,
-		MaxHeight:           b.maxHeight,
-		ShowID:              b.showID,
-		ClipboardRecoveryID: selection.PendingClipboardRecovery(),
-		ReqID:               b.reqID,
-		Generation:          b.generation,
-		SessionID:           b.sessionID,
-		Revision:            b.revision,
-		Phase:               b.phase,
-		Message:             b.message,
-		Trigger:             b.trigger,
-		Text:                b.text,
-		SourceLang:          b.sourceLang,
-		TargetLang:          b.targetLang,
-		Pinned:              b.pinned,
-		Settings:            cfg,
+		ID:         b.id,
+		MaxHeight:  b.maxHeight,
+		ShowID:     b.showID,
+		ReqID:      b.reqID,
+		Generation: b.generation,
+		SessionID:  b.sessionID,
+		Revision:   b.revision,
+		Phase:      b.phase,
+		Message:    b.message,
+		Trigger:    b.trigger,
+		Text:       b.text,
+		SourceLang: b.sourceLang,
+		TargetLang: b.targetLang,
+		Pinned:     b.pinned,
+		Settings:   cfg,
 	}
 }
 
@@ -529,18 +527,6 @@ func (m *Manager) createTransient(cfg config.Settings) *bubble {
 				m.actions.OpenSettings(b.win)
 			}
 		},
-		restoreClipboard: func(id string, done func(error)) {
-			go func() {
-				err := recoverClipboard(id)
-				b.win.Update(func() { done(err) })
-			}()
-		},
-		discardClipboard: func(id string, done func()) {
-			go func() {
-				selection.DiscardClipboardRecovery(id)
-				b.win.Update(done)
-			}()
-		},
 		copyText: func(_ *ui.Context, text string) error {
 			if err := mygo.Clipboard.Write(transfer.TextData(text)); err != nil {
 				log.Printf("write clipboard: %v", err)
@@ -643,21 +629,6 @@ func (m *Manager) createTransient(cfg config.Settings) *bubble {
 	m.transient = b
 	m.mu.Unlock()
 	return b
-}
-
-func recoverClipboard(id string) error {
-	err := selection.RecoverClipboard(id)
-	switch {
-	case err == nil:
-		return nil
-	case errors.Is(err, selection.ErrSourceChanged):
-		return errors.New("你已复制了新内容，本次没有覆盖它。可放弃恢复之前的内容，然后继续取词。")
-	case errors.Is(err, selection.ErrClipboardRecoveryGone):
-		return errors.New("之前的剪贴板内容已恢复或已放弃恢复，请重新打开面板。")
-	default:
-		log.Printf("clipboard recovery: %v", err)
-		return errors.New("暂时无法恢复剪贴板，之前的内容仍在，可稍后重试。")
-	}
 }
 
 // position puts the bubble near where the user is: beside an anchor

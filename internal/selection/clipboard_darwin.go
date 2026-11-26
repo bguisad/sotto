@@ -4,7 +4,9 @@ package selection
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,14 +55,14 @@ func pasteboardChange() (n int64) {
 	return
 }
 
-func savePasteboard(ctx context.Context) (*clipboardSnapshot, error) {
+func savePasteboard(ctx context.Context) ([]pasteboardItem, error) {
 	return snapshotMacPasteboard(ctx, pasteboard, pasteboardOnMain)
 }
 
 // Yield the main thread between representations and copy immutable NSData on
 // the caller's background goroutine. A promised dataForType call is still
 // synchronous; cancellation is checked before and after each AppKit turn.
-func snapshotMacPasteboard(ctx context.Context, getBoard func() objc.ID, onMain func(func())) (*clipboardSnapshot, error) {
+func snapshotMacPasteboard(ctx context.Context, getBoard func() objc.ID, onMain func(func())) ([]pasteboardItem, error) {
 	var board, array objc.ID
 	var items []objc.ID
 	var types [][]string
@@ -143,71 +145,38 @@ func snapshotMacPasteboard(ctx context.Context, getBoard func() objc.ID, onMain 
 	if err != nil {
 		return nil, err
 	}
-	return &clipboardSnapshot{mac: &macClipboardSnapshot{items: data, change: change}}, nil
+	return data, nil
 }
 
-// Materialize the native replacement before clearing anything. There is no
-// pasteboard lock/CAS on macOS: recheck after clear too, and retain failures.
-func restorePasteboard(saved *clipboardSnapshot, expected int64, guard func() bool) (restored bool, retryChange int64, err error) {
-	// RunOnMain drops work after shutdown; that must not create a retry target.
-	retryChange, err = -1, ErrSourceChanged
-	pasteboardOnMain(func() {
-		board := pasteboard()
-		var objects objc.ID
-		restored, retryChange, err = restorePasteboardContents(expected, pasteboardRestoreOps{
-			prepare: func() error {
-				objects = macnative.Array()
-				for _, formats := range saved.mac.items {
-					item := macnative.Class("NSPasteboardItem").Send(macnative.Sel("alloc")).Send(macnative.Sel("init"))
-					item.Send(macnative.Sel("autorelease"))
-					for _, f := range formats {
-						if !objc.Send[bool](item, macnative.Sel("setData:forType:"), macnative.Data(f.data), macnative.String(f.name)) {
-							return fmt.Errorf("prepare pasteboard type %s", f.name)
-						}
+// Materialize the native replacement before clearing and recheck the version
+// after the clear, since macOS has no pasteboard lock.
+func restorePasteboard(board objc.ID, saved []pasteboardItem, expected int64, guard func() bool) error {
+	var objects objc.ID
+	return restorePasteboardContents(expected, pasteboardRestoreOps{
+		prepare: func() error {
+			objects = macnative.Array()
+			for _, formats := range saved {
+				item := macnative.Class("NSPasteboardItem").Send(macnative.Sel("alloc")).Send(macnative.Sel("init"))
+				item.Send(macnative.Sel("autorelease"))
+				for _, f := range formats {
+					if !objc.Send[bool](item, macnative.Sel("setData:forType:"), macnative.Data(f.data), macnative.String(f.name)) {
+						return fmt.Errorf("prepare pasteboard type %s", f.name)
 					}
-					objects.Send(macnative.Sel("addObject:"), item)
 				}
-				return nil
-			},
-			allowed: func() bool { return guard == nil || guard() },
-			change:  func() int64 { return objc.Send[int64](board, macnative.Sel("changeCount")) },
-			clear:   func() int64 { return objc.Send[int64](board, macnative.Sel("clearContents")) },
-			write: func() error {
-				if len(saved.mac.items) != 0 && !objc.Send[bool](board, macnative.Sel("writeObjects:"), objects) {
-					return fmt.Errorf("restore pasteboard items")
-				}
-				return nil
-			},
-		})
+				objects.Send(macnative.Sel("addObject:"), item)
+			}
+			return nil
+		},
+		allowed: guard,
+		change:  func() int64 { return objc.Send[int64](board, macnative.Sel("changeCount")) },
+		clear:   func() int64 { return objc.Send[int64](board, macnative.Sel("clearContents")) },
+		write: func() error {
+			if len(saved) != 0 && !objc.Send[bool](board, macnative.Sel("writeObjects:"), objects) {
+				return fmt.Errorf("restore pasteboard items")
+			}
+			return nil
+		},
 	})
-	return
-}
-
-func retainPasteboard(saved *clipboardSnapshot, expected int64) {
-	// -1 means that a concurrent input/source change made ownership unknown.
-	// Keep the backup, but require discarding it rather than overwriting newer data.
-	saved.mac.restoreChange = expected
-	retainClipboardRecovery(saved, 0)
-}
-
-func RecoverClipboard(id string) error {
-	<-clipboardMu
-	defer func() { clipboardMu <- struct{}{} }()
-	clipboardRecovery.Lock()
-	saved, activeID := clipboardRecovery.snapshot, clipboardRecovery.id
-	clipboardRecovery.Unlock()
-	if id == "" || id != activeID || saved == nil || saved.mac == nil {
-		return ErrClipboardRecoveryGone
-	}
-	ok, retryChange, err := restorePasteboard(saved, saved.mac.restoreChange, nil)
-	if !ok {
-		saved.mac.restoreChange = retryChange
-		return err
-	}
-	clipboardRecovery.Lock()
-	clipboardRecovery.id, clipboardRecovery.snapshot = "", nil
-	clipboardRecovery.Unlock()
-	return nil
 }
 
 func copyControlsHeld() bool {
@@ -227,14 +196,16 @@ func copyControlsHeld() bool {
 	return false
 }
 
+// Monitor key, modifier, and mouse button events. Scrolling can continue during capture.
+const macCopyInputMask uint64 = 1<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<10 | 1<<11 | 1<<12 | 1<<25 | 1<<26
+
 func watchMacCopyInput() (*copyInputState, func(), error) {
 	state := &copyInputState{marker: uintptr(0x5354544f00000000 | copyMarker.Add(1))}
 	var stops []func()
 	var err error
 	mygo.RunOnMain(func() {
-		const mask uint64 = 1<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<10 | 1<<11 | 1<<12 | 1<<22 | 1<<25 | 1<<26
 		for _, local := range []bool{false, true} {
-			stop, e := macnative.Monitor(mask, local, func(event objc.ID) {
+			stop, e := macnative.Monitor(macCopyInputMask, local, func(event objc.ID) {
 				cg := event.Send(macnative.Sel("CGEvent"))
 				if cg == 0 || uintptr(getField(uintptr(cg), 42)) != state.marker {
 					state.invalidate(copyInputKey)
@@ -280,25 +251,30 @@ func copyMacSelection(ctx context.Context, source macSource) (Selection, error) 
 	case <-clipboardMu:
 	}
 	defer func() { clipboardMu <- struct{}{} }()
-	if PendingClipboardRecovery() != "" {
-		return Selection{}, ErrClipboardRestore
-	}
 	if err := waitCopyRelease(ctx, copyControlsHeld); err != nil {
 		return Selection{}, err
-	}
-	saved, err := savePasteboard(ctx)
-	if err != nil {
-		return Selection{}, fmt.Errorf("%w: %w", ErrClipboardUnsafe, err)
 	}
 	watch, stop, err := watchMacCopyInput()
 	if err != nil {
 		return Selection{}, fmt.Errorf("%w: %w", ErrClipboardUnsafe, err)
 	}
 	defer stop()
+	before := pasteboardChange()
+	saved, err := savePasteboard(ctx)
+	if err != nil {
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return Selection{}, cancelErr
+		}
+		if errors.Is(err, ErrSourceChanged) {
+			return Selection{}, err
+		}
+		log.Printf("selection: clipboard copy without restore: %v", err)
+	}
+
 	if err := source.check(ctx); err != nil {
 		return Selection{}, err
 	}
-	if pasteboardChange() != saved.mac.change || copyControlsHeld() || !watch.unchanged() || secureInput() {
+	if pasteboardChange() != before || copyControlsHeld() || !watch.unchanged() || secureInput() {
 		return Selection{}, ErrSourceChanged
 	}
 	down, up := createKey(0, 8, true), createKey(0, 8, false)
@@ -313,14 +289,6 @@ func copyMacSelection(ctx context.Context, source macSource) (Selection, error) 
 	}
 	defer cfRelease(down)
 	defer cfRelease(up)
-	restored := false
-	defer func() {
-		// Cancellation or timeout can win the select after the source already
-		// copied. Preserve the original even on those early return paths.
-		if !restored && PendingClipboardRecovery() == "" && pasteboardChange() != saved.mac.change {
-			retainPasteboard(saved, -1)
-		}
-	}()
 	for _, event := range []uintptr{down, up} {
 		setFlags(event, 1<<20)
 		setField(event, 42, int64(watch.marker))
@@ -335,40 +303,44 @@ func copyMacSelection(ctx context.Context, source macSource) (Selection, error) 
 		case <-ctx.Done():
 			return Selection{}, ctx.Err()
 		case <-wait.C:
-			return Selection{}, ErrNoSelection
+			return Selection{}, context.DeadlineExceeded
 		case <-tick.C:
-			n := pasteboardChange()
-			if n == saved.mac.change {
-				if err := source.check(ctx); err != nil {
-					return Selection{}, err
-				}
-				continue
+			if err := source.check(ctx); err != nil {
+				return Selection{}, err
 			}
-			// Once a copy wrote, every failure preserves the original snapshot.
-			if !watch.unchanged() || source.check(ctx) != nil || secureInput() {
-				retainPasteboard(saved, -1)
-				return Selection{}, ErrClipboardRestore
+			if !watch.unchanged() || secureInput() {
+				return Selection{}, ErrSourceChanged
+			}
+			n := pasteboardChange()
+			if n == before {
+				continue
 			}
 			var text string
 			pasteboardOnMain(func() {
 				text = macnative.GoString(pasteboard().Send(macnative.Sel("stringForType:"), macnative.String("public.utf8-plain-text")))
 			})
-			if !watch.unchanged() || source.check(ctx) != nil || pasteboardChange() != n || secureInput() {
-				retainPasteboard(saved, -1)
-				return Selection{}, ErrClipboardRestore
+			if err := source.check(ctx); err != nil {
+				return Selection{}, err
 			}
-			if ok, expected, err := restorePasteboard(saved, n, func() bool { return watch.unchanged() && source.check(ctx) == nil && !secureInput() }); !ok {
-				if !watch.unchanged() || source.check(ctx) != nil {
-					expected = -1
-				}
-				retainPasteboard(saved, expected)
-				return Selection{}, fmt.Errorf("%w: %w", ErrClipboardRestore, err)
+			if !watch.unchanged() || pasteboardChange() != n || secureInput() {
+				return Selection{}, ErrSourceChanged
 			}
-			restored = true
-			if text == "" {
-				return Selection{}, ErrNoSelection
+			if saved == nil {
+				return finishClipboardCopy(ctx, text, nil)
 			}
-			return Selection{Text: text, Via: "clipboard"}, nil
+			err := ErrSourceChanged // Main-thread dispatch may stop during shutdown.
+			pasteboardOnMain(func() {
+				err = restorePasteboard(pasteboard(), saved, n, func() bool {
+					return watch.unchanged() && source.check(ctx) == nil && !secureInput()
+				})
+			})
+			if err != nil && (!watch.unchanged() || secureInput()) {
+				err = ErrSourceChanged
+			}
+			if sourceErr := source.check(ctx); sourceErr != nil {
+				return Selection{}, sourceErr
+			}
+			return finishClipboardCopy(ctx, text, err)
 		}
 	}
 }

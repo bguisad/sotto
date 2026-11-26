@@ -34,6 +34,23 @@ func TestMacSelectionFallbackAndPermission(t *testing.T) {
 	}
 }
 
+func TestMacSelectionDropsTextWhenSourceChangesAfterAX(t *testing.T) {
+	// Stale text could reach the error bubble alongside the source-change error.
+	var sourceErr error
+	sel, err := readMacSelection(t.Context(), func(context.Context) error { return sourceErr },
+		func(bool) error { return nil },
+		func(context.Context) (Selection, error) {
+			sourceErr = ErrSourceChanged
+			return Selection{Text: "previous window", HasRect: true}, nil
+		}, func(context.Context) (Selection, error) {
+			t.Fatal("sent copy to a different window")
+			return Selection{}, nil
+		})
+	if sel != (Selection{}) || !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("selection=%+v err=%v", sel, err)
+	}
+}
+
 func TestMacCopyWaitsForLastShortcutKey(t *testing.T) {
 	// Releasing Option before D used to cancel an already injected copy.
 	originalKey, originalButton := keyState, buttonState
@@ -57,4 +74,17 @@ func TestMacCopyWaitsForLastShortcutKey(t *testing.T) {
 			t.Fatalf("wait ended at %v with %v", time.Since(start), err)
 		}
 	})
+}
+
+func TestMacCopyMonitorAllowsScrollAndWatchesButtons(t *testing.T) {
+	// AppKit delivers wheel and trackpad scrolling as NSEventTypeScrollWheel.
+	const scrollWheel = 22
+	if macCopyInputMask&(1<<scrollWheel) != 0 {
+		t.Fatal("scrolling would interrupt the copy")
+	}
+	for _, event := range []uint{1, 2, 3, 4, 25, 26} {
+		if macCopyInputMask&(1<<event) == 0 {
+			t.Fatalf("missing mouse button event %d", event)
+		}
+	}
 }

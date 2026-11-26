@@ -1,9 +1,10 @@
 package selection
 
 import (
+	"context"
 	"errors"
-	"strconv"
-	"sync"
+	"fmt"
+	"log"
 )
 
 var clipboardMu = make(chan struct{}, 1)
@@ -18,31 +19,18 @@ type clipboardFormat struct {
 }
 
 type clipboardSnapshot struct {
-	sequence uint32
-	formats  []clipboardFormat
-	mac      *macClipboardSnapshot
+	formats []clipboardFormat
 }
 
-type restoreOutcome uint8
-
-const (
-	restoreSkipped restoreOutcome = iota
-	restoreComplete
-	restoreFailed
-)
-
 // The caller holds the native clipboard open across the guard and all writes.
-func restoreClipboardFormats(count, markers int, unchanged func() bool, clear func() error, write func(int) error) (restoreOutcome, error) {
+func restoreClipboardFormats(count, markers int, unchanged func() bool, clear func() error, write func(int) error) error {
 	if !unchanged() {
-		return restoreSkipped, nil
+		return ErrSourceChanged
 	}
 	if err := clear(); err != nil {
-		return restoreFailed, err
+		return err
 	}
-	if err := writeClipboardFormats(count, markers, write); err != nil {
-		return restoreFailed, err
-	}
-	return restoreComplete, nil
+	return writeClipboardFormats(count, markers, write)
 }
 
 // Retry only the failing format, while still holding the clipboard open.
@@ -66,36 +54,23 @@ func writeClipboardFormats(count, markers int, write func(int) error) error {
 	return errors.Join(failures...)
 }
 
-// At most one failed snapshot stays in memory; never write it in the background.
-// New fallback copies are blocked until it is recovered or explicitly discarded.
-var clipboardRecovery struct {
-	sync.Mutex
-	next     uint64
-	id       string
-	snapshot *clipboardSnapshot
-	sequence uint32
-}
-
-func retainClipboardRecovery(snapshot *clipboardSnapshot, sequence uint32) {
-	clipboardRecovery.Lock()
-	defer clipboardRecovery.Unlock()
-	clipboardRecovery.next++
-	clipboardRecovery.id = strconv.FormatUint(clipboardRecovery.next, 10)
-	clipboardRecovery.snapshot, clipboardRecovery.sequence = snapshot, sequence
-}
-
-func PendingClipboardRecovery() string {
-	clipboardRecovery.Lock()
-	defer clipboardRecovery.Unlock()
-	return clipboardRecovery.id
-}
-
-func DiscardClipboardRecovery(id string) {
-	<-clipboardMu
-	defer func() { clipboardMu <- struct{}{} }()
-	clipboardRecovery.Lock()
-	defer clipboardRecovery.Unlock()
-	if id == clipboardRecovery.id {
-		clipboardRecovery.id, clipboardRecovery.snapshot = "", nil
+// A failed write-back does not invalidate text already read from a stable copy.
+// Even an empty selection must run restoration if the copy replaced the clipboard.
+func finishClipboardCopy(ctx context.Context, text string, restoreErr error) (Selection, error) {
+	if err := ctx.Err(); err != nil {
+		return Selection{}, err
 	}
+	if errors.Is(restoreErr, ErrSourceChanged) {
+		return Selection{}, restoreErr
+	}
+	if restoreErr != nil {
+		if text == "" {
+			return Selection{}, fmt.Errorf("restore clipboard: %w", restoreErr)
+		}
+		log.Printf("selection: clipboard restore incomplete: %v", restoreErr)
+	}
+	if text == "" {
+		return Selection{}, ErrNoSelection
+	}
+	return Selection{Text: text, Via: "clipboard"}, nil
 }

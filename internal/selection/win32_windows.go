@@ -35,7 +35,6 @@ var (
 	procEnumClipboardFormats       = modUser32.NewProc("EnumClipboardFormats")
 	procGetClipboardData           = modUser32.NewProc("GetClipboardData")
 	procSetClipboardData           = modUser32.NewProc("SetClipboardData")
-	procIsClipboardFormatAvailable = modUser32.NewProc("IsClipboardFormatAvailable")
 	procGetClipboardOwner          = modUser32.NewProc("GetClipboardOwner")
 	procRegisterClipboardFormatW   = modUser32.NewProc("RegisterClipboardFormatW")
 
@@ -181,16 +180,24 @@ func clipboardSeq() uint32 {
 	return uint32(seq)
 }
 
-// clipboardOwnerPID is the process that last wrote the clipboard, 0 when
-// the clipboard has no owner window (as ours, opened without one).
-func clipboardOwnerPID() uint32 {
+// A missing owner window permits reading a stable copy, but cannot authorize restoration.
+func checkClipboardOwner(sourcePID uint32) (bool, error) {
 	hwnd, _, _ := procGetClipboardOwner.Call()
-	if hwnd == 0 {
-		return 0
-	}
 	var pid uint32
-	procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
-	return pid
+	if hwnd != 0 {
+		procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+	}
+	return classifyClipboardOwner(sourcePID, hwnd, pid)
+}
+
+func classifyClipboardOwner(sourcePID uint32, hwnd uintptr, pid uint32) (bool, error) {
+	if hwnd == 0 {
+		return false, nil
+	}
+	if pid == 0 || pid != sourcePID {
+		return false, fmt.Errorf("clipboard owner hwnd=%x pid=%d source_pid=%d: %w", hwnd, pid, sourcePID, ErrSourceChanged)
+	}
+	return true, nil
 }
 
 // openClipboard opens the clipboard, retrying: another process can hold
@@ -253,6 +260,8 @@ func prepareClipboardRestore(snap *clipboardSnapshot) (*preparedClipboard, error
 			return nil, fmt.Errorf("prepare clipboard format %d (%s), bytes=%d: %w", f.id, clipboardFormatName(f.id), len(f.data), err)
 		}
 		p.handles[i] = h
+		// The native handle now owns a copy. Restoration only needs the format ID.
+		p.formats[i].data = nil
 	}
 	return p, nil
 }
@@ -272,15 +281,15 @@ func (p *preparedClipboard) free() {
 
 // Caller pins the OS thread through Open/CloseClipboard and owns a real HWND.
 // A changed clipboard is deliberately untouched; all other failures are surfaced.
-func (p *preparedClipboard) restore(owner uintptr, sequence uint32, unchanged func() bool) (restoreOutcome, uint32, error) {
+func (p *preparedClipboard) restore(owner uintptr, unchanged func() bool) error {
 	if owner == 0 {
-		return restoreFailed, sequence, fmt.Errorf("clipboard owner missing: %w", ErrClipboardRestore)
+		return fmt.Errorf("missing clipboard owner")
 	}
 	if !openClipboardFor(owner) {
-		return restoreFailed, sequence, fmt.Errorf("open clipboard: %w", ErrClipboardRestore)
+		return fmt.Errorf("open clipboard for restoration: clipboard remained unavailable")
 	}
 	defer closeClipboard()
-	outcome, err := restoreClipboardFormats(len(p.formats), 3, unchanged, func() error {
+	return restoreClipboardFormats(len(p.formats), 3, unchanged, func() error {
 		if ok, _, err := procEmptyClipboard.Call(); ok == 0 {
 			return fmt.Errorf("empty clipboard: %w", err)
 		}
@@ -292,37 +301,30 @@ func (p *preparedClipboard) restore(owner uintptr, sequence uint32, unchanged fu
 		p.handles[i] = 0
 		return nil
 	})
-	return outcome, clipboardSeq(), err
-}
-
-// clipboardHasText reports whether the clipboard holds text.
-func clipboardHasText() bool {
-	ok, _, _ := procIsClipboardFormatAvailable.Call(cfUnicodeText)
-	return ok != 0
 }
 
 // readClipboardText returns the clipboard's Unicode text. Windows
 // synthesizes it from the older text formats, so one format covers all.
-func readClipboardText() (string, bool) {
+func readClipboardText() string {
 	if !openClipboard() {
-		return "", false
+		return ""
 	}
 	defer closeClipboard()
 	h, _, _ := procGetClipboardData.Call(cfUnicodeText)
 	if h == 0 {
-		return "", false
+		return ""
 	}
 	size, _, _ := procGlobalSize.Call(h)
 	if size < 2 {
-		return "", false
+		return ""
 	}
 	p, _, _ := procGlobalLock.Call(h)
 	if p == 0 {
-		return "", false
+		return ""
 	}
 	defer procGlobalUnlock.Call(h)
 	runes := unsafe.Slice((*uint16)(native(p)), size/2)
-	return syscall.UTF16ToString(runes), true
+	return syscall.UTF16ToString(runes)
 }
 
 // physRectToDIP uses the same display selection as screen capture, so an
