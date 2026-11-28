@@ -6,6 +6,7 @@ package selection
 import (
 	"context"
 	"errors"
+	"log"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -52,6 +53,65 @@ var (
 	// ErrUnsupported: this platform has no selection grabbing.
 	ErrUnsupported = errors.New("selection is not supported on this platform")
 )
+
+var (
+	errTrySelectionParent = errors.New("native element does not expose selected text")
+	errProtectedSelection = errors.New("无法读取安全输入框中的内容")
+)
+
+// readSelectionParents starts only after the focused node misses. Keep each
+// acquired parent alive until the walk has advanced past it.
+func readSelectionParents[T comparable](ctx context.Context, node T, maxParents int, read func(context.Context, T) (Selection, error), parent func(T) T, release func(T)) (Selection, error) {
+	var none, owned T
+	defer func() {
+		if owned != none {
+			release(owned)
+		}
+	}()
+	for range maxParents {
+		if err := ctx.Err(); err != nil {
+			return Selection{}, err
+		}
+		next := parent(node)
+		if owned != none {
+			release(owned)
+		}
+		owned = next
+		if next == none {
+			break
+		}
+		node = next
+		if err := ctx.Err(); err != nil {
+			return Selection{}, err
+		}
+		sel, err := read(ctx, node)
+		if err != errTrySelectionParent {
+			return sel, err
+		}
+	}
+	return Selection{}, errTrySelectionParent
+}
+
+type selectionEntryKey struct{}
+
+// WithEntry associates native selection diagnostics with an application entry.
+func WithEntry(ctx context.Context, id int64) context.Context {
+	return context.WithValue(ctx, selectionEntryKey{}, id)
+}
+
+func logSelection(ctx context.Context, format string, args ...any) {
+	entry, _ := ctx.Value(selectionEntryKey{}).(int64)
+	log.Printf("selection: entry=%d "+format, append([]any{entry}, args...)...)
+}
+
+// Successful restores are covered by the final selection result.
+func logCopyResult(ctx context.Context, stage string, err error) {
+	if err != nil {
+		logSelection(ctx, "clipboard stage=%s err=%v", stage, err)
+	} else if stage == "read_without_restore" {
+		logSelection(ctx, "clipboard stage=%s", stage)
+	}
+}
 
 // Grab returns the selection of the foreground app: through UI
 // Automation where it answers, else by simulating a copy. It stays

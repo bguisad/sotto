@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -236,7 +235,9 @@ func watchMacCopyInput() (*copyInputState, func(), error) {
 	return state, stop, nil
 }
 
-func copyMacSelection(ctx context.Context, source macSource, mainKey int) (Selection, error) {
+func copyMacSelection(ctx context.Context, source macSource, mainKey int) (sel Selection, err error) {
+	stage := "check_source"
+	defer func() { logCopyResult(ctx, stage, err) }()
 	if err := loadAX(); err != nil {
 		return Selection{}, err
 	}
@@ -249,20 +250,24 @@ func copyMacSelection(ctx context.Context, source macSource, mainKey int) (Selec
 	if secureInput() {
 		return Selection{}, ErrClipboardUnsafe
 	}
+	stage = "wait_slot"
 	select {
 	case <-ctx.Done():
 		return Selection{}, ctx.Err()
 	case <-clipboardMu:
 	}
 	defer func() { clipboardMu <- struct{}{} }()
+	stage = "wait_input_release"
 	if err := waitCopyRelease(ctx, func() bool { return copyControlsHeld(mainKey) }); err != nil {
 		return Selection{}, err
 	}
+	stage = "watch_input"
 	watch, stop, err := watchMacCopyInput()
 	if err != nil {
 		return Selection{}, fmt.Errorf("%w: %w", ErrClipboardUnsafe, err)
 	}
 	defer stop()
+	stage = "snapshot"
 	before := pasteboardChange()
 	saved, err := savePasteboard(ctx)
 	if err != nil {
@@ -272,7 +277,7 @@ func copyMacSelection(ctx context.Context, source macSource, mainKey int) (Selec
 		if errors.Is(err, ErrSourceChanged) {
 			return Selection{}, err
 		}
-		log.Printf("selection: clipboard copy without restore: %v", err)
+		logSelection(ctx, "clipboard copy without restore: stage=%s err=%v", stage, err)
 	}
 
 	if err := source.check(ctx); err != nil {
@@ -281,6 +286,7 @@ func copyMacSelection(ctx context.Context, source macSource, mainKey int) (Selec
 	if pasteboardChange() != before || copyControlsHeld(mainKey) || !watch.unchanged() || secureInput() {
 		return Selection{}, ErrSourceChanged
 	}
+	stage = "send_copy"
 	down, up := createKey(0, 8, true), createKey(0, 8, false)
 	if down == 0 || up == 0 {
 		if down != 0 {
@@ -298,6 +304,7 @@ func copyMacSelection(ctx context.Context, source macSource, mainKey int) (Selec
 		setField(event, 42, int64(watch.marker))
 		postEvent(1, event)
 	}
+	stage = "wait_copy"
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	wait := time.NewTimer(time.Second)
@@ -319,6 +326,7 @@ func copyMacSelection(ctx context.Context, source macSource, mainKey int) (Selec
 			if n == before {
 				continue
 			}
+			stage = "read_copy"
 			var text string
 			pasteboardOnMain(func() {
 				text = macnative.GoString(pasteboard().Send(macnative.Sel("stringForType:"), macnative.String("public.utf8-plain-text")))
@@ -330,8 +338,10 @@ func copyMacSelection(ctx context.Context, source macSource, mainKey int) (Selec
 				return Selection{}, ErrSourceChanged
 			}
 			if saved == nil {
+				stage = "read_without_restore"
 				return finishClipboardCopy(ctx, text, nil)
 			}
+			stage = "restore"
 			err := ErrSourceChanged // Main-thread dispatch may stop during shutdown.
 			pasteboardOnMain(func() {
 				err = restorePasteboard(pasteboard(), saved, n, func() bool {

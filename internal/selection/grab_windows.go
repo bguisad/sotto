@@ -4,8 +4,8 @@ package selection
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
 
 	"golang.org/x/sys/windows"
 )
@@ -23,15 +23,15 @@ import (
 func Prepare(_ string) func(context.Context) (Selection, error) {
 	hwnd, pid, class := foregroundWindow()
 	self := pid != 0 && pid == windows.GetCurrentProcessId()
-	log.Printf("selection: source hwnd=%x pid=%d class=%q self=%t", hwnd, pid, class, self)
 	return func(ctx context.Context) (Selection, error) {
+		logSelection(ctx, "event=source pid=%d self=%t hwnd=%x class=%q", pid, self, hwnd, class)
 		if self {
 			return Selection{}, ErrSelfWindow
 		}
 		if !sameForeground(hwnd, pid) {
 			return Selection{}, fmt.Errorf("foreground before UIA: %w", ErrSourceChanged)
 		}
-		sel, err := grabUIA(ctx)
+		sel, err := grabUIAFrom(ctx, pid)
 		if ctx.Err() != nil {
 			return Selection{}, ctx.Err()
 		}
@@ -41,7 +41,10 @@ func Prepare(_ string) func(context.Context) (Selection, error) {
 		if err == nil && sel.Text != "" {
 			return sel, nil
 		}
-		log.Printf("selection: clipboard fallback hwnd=%x pid=%d class=%q uia_error=%v", hwnd, pid, class, err)
+		if errors.Is(err, errProtectedSelection) {
+			return Selection{}, err
+		}
+		logSelection(ctx, "fallback=clipboard")
 		return grabClipboardFrom(ctx, hwnd, pid, class)
 	}
 }

@@ -6,9 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"runtime"
-	"time"
 )
 
 func grabClipboard(ctx context.Context) (Selection, error) {
@@ -19,16 +17,15 @@ func grabClipboard(ctx context.Context) (Selection, error) {
 // A copy is a bounded transaction. Never undo a late write in the background:
 // a later deliberate copy from the same process cannot be distinguished by PID.
 func grabClipboardFrom(ctx context.Context, hwnd uintptr, pid uint32, class string) (sel Selection, err error) {
-	started, stage := time.Now(), "wait_slot"
-	defer func() {
-		log.Printf("selection: clipboard stage=%s hwnd=%x pid=%d elapsed=%s err=%v", stage, hwnd, pid, time.Since(started).Round(time.Millisecond), err)
-	}()
+	stage := "wait_slot"
+	defer func() { logCopyResult(ctx, stage, err) }()
 	select {
 	case <-ctx.Done():
 		return Selection{}, ctx.Err()
 	case <-clipboardMu:
 	}
 	defer func() { clipboardMu <- struct{}{} }()
+	stage = "check_source"
 	chord, ok := copyChordFor(class)
 	if !ok {
 		return Selection{}, ErrNoSelection
@@ -63,10 +60,11 @@ func grabClipboardFrom(ctx context.Context, hwnd uintptr, pid uint32, class stri
 		prepared, err = prepareClipboardRestore(saved)
 	}
 	if err != nil {
-		log.Printf("selection: clipboard copy without restore: stage=%s err=%v", stage, err)
+		logSelection(ctx, "clipboard copy without restore: stage=%s err=%v", stage, err)
 	} else {
 		defer prepared.free()
 	}
+	stage = "send_copy"
 	// A delayed clipboard provider can take time. Recheck the source before injecting copy.
 	if copyControlsDown(keyDown) {
 		return Selection{}, fmt.Errorf("key or button held before copy injection: %w", ErrSourceChanged)
@@ -80,7 +78,6 @@ func grabClipboardFrom(ctx context.Context, hwnd uintptr, pid uint32, class stri
 	if err := watch.check("preparing to send copy"); err != nil {
 		return Selection{}, err
 	}
-	stage = "send_copy"
 	if !sendCopy(chord, watch.marker) {
 		return Selection{}, ErrNoSelection
 	}

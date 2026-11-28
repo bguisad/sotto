@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 )
 
 var clipboardMu = make(chan struct{}, 1)
@@ -67,7 +66,7 @@ func finishClipboardCopy(ctx context.Context, text string, restoreErr error) (Se
 		if text == "" {
 			return Selection{}, fmt.Errorf("restore clipboard: %w", restoreErr)
 		}
-		log.Printf("selection: clipboard restore incomplete: %v", restoreErr)
+		logSelection(ctx, "clipboard restore incomplete: %v", restoreErr)
 	}
 	if text == "" {
 		return Selection{}, ErrNoSelection

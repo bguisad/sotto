@@ -266,7 +266,9 @@ func (a *application) startEntry(action string) {
 	if action == "selection" || task.minimal {
 		task.cursor = mygo.Screen.CursorScreenPoint()
 	}
-	log.Printf("entry: start id=%d action=%s", task.ID(), action)
+	if action != "selection" {
+		log.Printf("entry: start id=%d action=%s", task.ID(), action)
+	}
 	switch action {
 	case "panel":
 		a.snip.Hide()
@@ -297,16 +299,19 @@ func (a *application) grabSelection(task *entryTask, grab func(context.Context) 
 	ctx, cancel := context.WithTimeout(task.Context(), 5*time.Second)
 	defer cancel()
 	started := time.Now()
-	sel, err := grab(ctx)
+	sel, err := grab(selection.WithEntry(ctx, task.ID()))
 	valid := task.Valid()
-	log.Printf("selection: end entry=%d current=%t via=%s elapsed=%s err=%v", task.ID(), valid, sel.Via, time.Since(started).Round(time.Millisecond), err)
+	elapsed := time.Since(started).Round(time.Millisecond)
 	if !valid {
+		log.Printf("selection: entry=%d discarded elapsed=%s", task.ID(), elapsed)
 		return
 	}
-	message := selectionFeedback(err)
 	if err != nil {
-		log.Printf("selection: %v", err)
+		log.Printf("selection: entry=%d failed elapsed=%s err=%v", task.ID(), elapsed, err)
+	} else {
+		log.Printf("selection: entry=%d via=%s elapsed=%s", task.ID(), sel.Via, elapsed)
 	}
+	message := selectionFeedback(err)
 	// Selection text is not OCR: preserve tabs, paragraph spacing and joiners.
 	sel.Text = strings.TrimSpace(strings.ReplaceAll(strings.TrimPrefix(sel.Text, "\ufeff"), "\r\n", "\n"))
 	if sel.Text == "" && message == "" {

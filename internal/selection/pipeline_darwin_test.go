@@ -20,7 +20,12 @@ func TestMacSelectionFallbackAndPermission(t *testing.T) {
 		copied                 bool
 		wantErr                error
 	}{
-		{text: "selected"}, {readErr: ErrNoSelection, copied: true}, {copied: true}, {permissionErr: denied, wantErr: denied}, {readErr: ErrSourceChanged, wantErr: ErrSourceChanged},
+		{text: "selected"},
+		{readErr: ErrNoSelection, copied: true},
+		{copied: true},
+		{permissionErr: denied, wantErr: denied},
+		{readErr: ErrSourceChanged, wantErr: ErrSourceChanged},
+		{readErr: errProtectedSelection, wantErr: errProtectedSelection},
 	} {
 		copied := false
 		_, err := readMacSelection(context.Background(), func(ctx context.Context) error { return ctx.Err() }, func(bool) error { return tc.permissionErr }, func(context.Context) (Selection, error) { return Selection{Text: tc.text}, tc.readErr }, func(context.Context) (Selection, error) { copied = true; return Selection{Text: "copy"}, nil })

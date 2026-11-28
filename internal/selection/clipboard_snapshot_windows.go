@@ -5,9 +5,7 @@ package selection
 import (
 	"encoding/binary"
 	"fmt"
-	"log"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -26,17 +24,6 @@ var (
 // The caller pins the OS thread. Read delayed formats and record the final
 // sequence under one open, before copy can replace any original content.
 func saveClipboard() (snap *clipboardSnapshot, sequence uint32, err error) {
-	started := time.Now()
-	defer func() {
-		var formats, size int
-		if snap != nil {
-			formats = len(snap.formats)
-			for _, f := range snap.formats {
-				size += len(f.data)
-			}
-		}
-		log.Printf("selection: clipboard stage=snapshot formats=%d bytes=%d elapsed=%s err=%v", formats, size, time.Since(started).Round(time.Millisecond), err)
-	}()
 	sequence = clipboardSeq()
 	if !openClipboard() {
 		return nil, sequence, fmt.Errorf("open clipboard for snapshot: clipboard remained unavailable")
@@ -53,11 +40,14 @@ func saveClipboard() (snap *clipboardSnapshot, sequence uint32, err error) {
 		if id == 0 && callErr != syscall.Errno(0) {
 			return 0, callErr
 		}
-		if id != 0 {
-			log.Printf("selection: clipboard stage=enumerate format=%d name=%q", id, clipboardFormatName(uint16(id)))
-		}
 		return uint16(id), nil
-	}, readClipboardFormat)
+	}, func(id uint16, remaining uintptr) ([]byte, error) {
+		data, err := readClipboardFormat(id, remaining)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", clipboardFormatName(id), err)
+		}
+		return data, nil
+	})
 	// Delayed rendering can advance the sequence even when a later format fails.
 	return snap, clipboardSeq(), err
 }
@@ -105,11 +95,7 @@ func clipboardFormatName(id uint16) string {
 	return "unknown"
 }
 
-func readClipboardFormat(id uint16, remaining uintptr) (data []byte, err error) {
-	started := time.Now()
-	defer func() {
-		log.Printf("selection: clipboard stage=read format=%d name=%q bytes=%d elapsed=%s err=%v", id, clipboardFormatName(id), len(data), time.Since(started).Round(time.Millisecond), err)
-	}()
+func readClipboardFormat(id uint16, remaining uintptr) ([]byte, error) {
 	h, _, err := procGetClipboardData.Call(uintptr(id))
 	if h == 0 {
 		return nil, clipboardCallError("GetClipboardData returned no handle", err)
@@ -129,7 +115,7 @@ func readClipboardFormat(id uint16, remaining uintptr) (data []byte, err error) 
 		return nil, clipboardCallError("GlobalLock returned no address", err)
 	}
 	defer procGlobalUnlock.Call(h)
-	data = make([]byte, size)
+	data := make([]byte, size)
 	copy(data, unsafe.Slice((*byte)(native(p)), size))
 	return data, nil
 }

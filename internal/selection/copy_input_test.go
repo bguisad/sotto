@@ -130,18 +130,19 @@ func TestCopyWaitsForLastFormatBatch(t *testing.T) {
 
 func TestCopySettlingStopsOnTimeoutOrSourceChange(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		sample  func(uint32) (uint32, error)
-		wantErr error
+		name       string
+		sample     func(uint32) (uint32, error)
+		wantErr    error
+		wantDetail string
 	}{
-		{"old clipboard", func(uint32) (uint32, error) { return 10, nil }, context.DeadlineExceeded},
-		{"continuous changes", func(i uint32) (uint32, error) { return 10 + i, nil }, context.DeadlineExceeded},
+		{"old clipboard", func(uint32) (uint32, error) { return 10, nil }, context.DeadlineExceeded, "changes=0 "},
+		{"continuous changes", func(i uint32) (uint32, error) { return 10 + i, nil }, context.DeadlineExceeded, "changes="},
 		{"interrupted", func(i uint32) (uint32, error) {
 			if i == 3 {
 				return 0, ErrSourceChanged
 			}
 			return 11, nil
-		}, ErrSourceChanged},
+		}, ErrSourceChanged, "changes=1 "},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -153,6 +154,10 @@ func TestCopySettlingStopsOnTimeoutOrSourceChange(t *testing.T) {
 				})
 				if seq != 0 || !errors.Is(err, test.wantErr) || time.Since(started) > time.Second {
 					t.Fatalf("sequence=%d elapsed=%v err=%v", seq, time.Since(started), err)
+				}
+				// A copy timeout with no clipboard changes used to lose that detail.
+				if !strings.Contains(err.Error(), test.wantDetail) {
+					t.Fatalf("error %q is missing %q", err, test.wantDetail)
 				}
 			})
 		})

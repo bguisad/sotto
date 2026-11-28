@@ -3,7 +3,10 @@
 package selection
 
 import (
+	"bytes"
 	"errors"
+	"log"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"unsafe"
@@ -115,8 +118,8 @@ func TestUIAKeepsTextWhenBoundsStall(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		release := make(chan struct{})
 		defer close(release)
-		sel, err := grabUIAWith(t.Context(), func(selected func(string)) (Selection, error) {
-			selected("selected text")
+		sel, err := grabUIAWith(t.Context(), func(selected func(string, string)) (Selection, error) {
+			selected("selected text", "ancestor")
 			<-release
 			return Selection{Text: "selected text", Via: "uia", HasRect: true}, nil
 		})
@@ -124,6 +127,37 @@ func TestUIAKeepsTextWhenBoundsStall(t *testing.T) {
 			t.Fatalf("got %+v, %v while bounds were pending", sel, err)
 		}
 	})
+}
+
+func TestUIALogsMissingRangesSeparatelyFromEmptyText(t *testing.T) {
+	// Empty ranges and ranges with no readable text had the same outcome.
+	for _, tc := range []struct {
+		outcome string
+		err     error
+	}{
+		{"pattern_missing", errUIAPatternMissing},
+		{"empty", errUIAEmpty},
+		{"no_text", nil},
+		{"protected", errProtectedSelection},
+	} {
+		t.Run(tc.outcome, func(t *testing.T) {
+			var output bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&output)
+			t.Cleanup(func() { log.SetOutput(previous) })
+			synctest.Test(t, func(t *testing.T) {
+				_, err := grabUIAWith(WithEntry(t.Context(), 42), func(func(string, string)) (Selection, error) {
+					return Selection{}, tc.err
+				})
+				if !errors.Is(err, tc.err) {
+					t.Fatalf("error = %v, want %v", err, tc.err)
+				}
+			})
+			if want := "entry=42 uia outcome=" + tc.outcome + " "; !strings.Contains(output.String(), want) {
+				t.Fatalf("log %q is missing %q", output.String(), want)
+			}
+		})
+	}
 }
 
 // Some foreground apps publish usable text without assigning an owner window.

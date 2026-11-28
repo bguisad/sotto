@@ -24,6 +24,7 @@ var (
 	axAttribute            func(uintptr, objc.ID, *uintptr) int32
 	axParameter            func(uintptr, objc.ID, uintptr, *uintptr) int32
 	axTimeout              func(uintptr, float32) int32
+	axPID                  func(uintptr, *int32) int32
 	axValue                func(uintptr, uint32, unsafe.Pointer) bool
 	axValueType            func(uintptr) uint32
 	axElementID, axValueID func() uint64
@@ -45,6 +46,7 @@ var loadAX = sync.OnceValue(func() error {
 		macnative.Symbol{Target: &axAttribute, Name: "AXUIElementCopyAttributeValue"},
 		macnative.Symbol{Target: &axParameter, Name: "AXUIElementCopyParameterizedAttributeValue"},
 		macnative.Symbol{Target: &axTimeout, Name: "AXUIElementSetMessagingTimeout"},
+		macnative.Symbol{Target: &axPID, Name: "AXUIElementGetPid"},
 		macnative.Symbol{Target: &axValue, Name: "AXValueGetValue"},
 		macnative.Symbol{Target: &axValueType, Name: "AXValueGetType"})
 })
@@ -86,6 +88,7 @@ func Prepare(shortcut string) func(context.Context) (Selection, error) {
 	s := prepareMacSource()
 	mainKey := hotkey.MacMainKeyCode(shortcut)
 	return func(ctx context.Context) (Selection, error) {
+		logSelection(ctx, "event=source pid=%d self=%t", s.pid, s.self)
 		return readMacSelection(ctx, s.check, macnative.RequireAccessibility, func(ctx context.Context) (Selection, error) { return readAX(ctx, s) }, func(ctx context.Context) (Selection, error) { return copyMacSelection(ctx, s, mainKey) })
 	}
 }
@@ -110,6 +113,7 @@ func readMacSelection(ctx context.Context, check func(context.Context) error, pe
 	if err := check(ctx); err != nil {
 		return Selection{}, err
 	}
+	logSelection(ctx, "fallback=clipboard")
 	return copy(ctx)
 }
 
@@ -129,9 +133,26 @@ func grabClipboard(ctx context.Context) (Selection, error) {
 	return copyMacSelection(ctx, s, -1)
 }
 
+const (
+	axSelectionTimeout     = 250 * time.Millisecond
+	axAttributeUnsupported = -25205
+	axNoValue              = -25212
+)
+
 var axAdmission = make(chan struct{}, 1)
 
 func readAX(ctx context.Context, s macSource) (sel Selection, err error) {
+	started, outcome, hit := time.Now(), "miss", "focus"
+	defer func() {
+		switch {
+		case err == nil:
+			logSelection(ctx, "ax hit=%s elapsed=%s", hit, time.Since(started).Round(time.Millisecond))
+		case errors.Is(err, ErrNoSelection):
+			logSelection(ctx, "ax outcome=%s elapsed=%s", outcome, time.Since(started).Round(time.Millisecond))
+		default:
+			logSelection(ctx, "ax err=%v elapsed=%s", err, time.Since(started).Round(time.Millisecond))
+		}
+	}()
 	if err := loadAX(); err != nil {
 		return sel, err
 	}
@@ -154,16 +175,7 @@ func readAX(ctx context.Context, s macSource) (sel Selection, err error) {
 			return
 		}
 		defer cfRelease(app)
-		timeout := float32(.25)
-		if deadline, ok := ctx.Deadline(); ok {
-			timeout = min(timeout, float32(time.Until(deadline).Seconds()))
-		}
-		if timeout <= 0 {
-			err = context.DeadlineExceeded
-			return
-		}
-		if code := axTimeout(app, timeout); code != 0 {
-			err = fmt.Errorf("AX messaging timeout: %d", code)
+		if err = setAXSelectionTimeout(ctx, app); err != nil {
 			return
 		}
 		var focus uintptr
@@ -176,59 +188,138 @@ func readAX(ctx context.Context, s macSource) (sel Selection, err error) {
 			err = ErrNoSelection
 			return
 		}
-		if err = ctx.Err(); err != nil {
+		if err = setAXSelectionTimeout(ctx, focus); err != nil {
 			return
 		}
-		var subrole uintptr
-		if axAttribute(focus, macnative.String("AXSubrole"), &subrole) == 0 && subrole != 0 {
-			defer cfRelease(subrole)
-			if cfTypeID(subrole) == cfStringID() && macnative.GoString(objc.ID(subrole)) == "AXSecureTextField" {
-				err = errors.New("无法读取安全输入框中的内容")
-				return
-			}
+		read := func(ctx context.Context, node uintptr) (Selection, error) {
+			return readAXElementSelection(ctx, node, &outcome)
 		}
-		if err = ctx.Err(); err != nil {
+		sel, err = read(ctx, focus)
+		if err != errTrySelectionParent {
 			return
 		}
-		var text uintptr
-		if axAttribute(focus, macnative.String("AXSelectedText"), &text) != 0 || text == 0 {
+		// Give the added traversal its own budget before falling back to copy.
+		walkCtx, cancel := context.WithTimeout(ctx, axSelectionTimeout)
+		defer cancel()
+		hit = "ancestor"
+		sel, err = readSelectionParents(walkCtx, focus, 16, read, func(node uintptr) uintptr {
+			return axSelectionParent(walkCtx, node, s.pid)
+		}, cfRelease)
+		if err == context.DeadlineExceeded || walkCtx.Err() == context.DeadlineExceeded && err == errTrySelectionParent {
+			outcome, err = "timeout", ErrNoSelection
+		} else if err == errTrySelectionParent {
 			err = ErrNoSelection
-			return
-		}
-		defer cfRelease(text)
-		if cfTypeID(text) != cfStringID() {
-			err = ErrNoSelection
-			return
-		}
-		sel = Selection{Text: macnative.GoString(objc.ID(text)), Via: "ax"}
-		if err = ctx.Err(); err != nil {
-			return
-		}
-		if sel.Text == "" {
-			err = ErrNoSelection
-			return
-		}
-		var span uintptr
-		if axAttribute(focus, macnative.String("AXSelectedTextRange"), &span) == 0 && span != 0 {
-			defer cfRelease(span)
-			if cfTypeID(span) != axValueID() || axValueType(span) != 4 {
-				return
-			}
-			var bounds uintptr
-			if axParameter(focus, macnative.String("AXBoundsForRange"), span, &bounds) == 0 && bounds != 0 {
-				defer cfRelease(bounds)
-				var r macnative.Rect
-				if cfTypeID(bounds) == axValueID() && axValueType(bounds) == 3 && axValue(bounds, 3, unsafe.Pointer(&r)) && r.Size.Width > 0 && r.Size.Height > 0 && math.Abs(r.Origin.X) <= 1<<30 && math.Abs(r.Origin.Y) <= 1<<30 && r.Size.Width <= 1<<30 && r.Size.Height <= 1<<30 {
-					sel.Rect = Rect{int(math.Round(r.Origin.X)), int(math.Round(r.Origin.Y)), int(math.Round(r.Size.Width)), int(math.Round(r.Size.Height))}
-					sel.HasRect = true
-				}
-			}
 		}
 	})
 	if sourceErr := s.check(ctx); sourceErr != nil {
 		return Selection{}, sourceErr
 	}
 	return sel, err
+}
+
+// AX messaging timeouts belong to individual element references.
+func setAXSelectionTimeout(ctx context.Context, node uintptr) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeout := axSelectionTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = min(timeout, time.Until(deadline))
+	}
+	if timeout <= 0 {
+		return context.DeadlineExceeded
+	}
+	if code := axTimeout(node, float32(timeout.Seconds())); code != 0 {
+		return fmt.Errorf("AX messaging timeout: %d", code)
+	}
+	return nil
+}
+
+// A focused link may omit selected text that its containing document exposes.
+func axSelectionParent(ctx context.Context, node uintptr, pid int32) uintptr {
+	var parent uintptr
+	if axAttribute(node, macnative.String("AXParent"), &parent) != 0 || parent == 0 {
+		return 0
+	}
+	var owner int32
+	if cfTypeID(parent) == axElementID() && axPID(parent, &owner) == 0 && owner == pid && setAXSelectionTimeout(ctx, parent) == nil {
+		// Window and application nodes can aggregate unrelated selections.
+		role, _ := axStringAttribute(parent, "AXRole")
+		if role != "" && role != "AXWindow" && role != "AXApplication" {
+			return parent
+		}
+	}
+	cfRelease(parent)
+	return 0
+}
+
+func axStringAttribute(node uintptr, attribute string) (string, int32) {
+	var value uintptr
+	code := axAttribute(node, macnative.String(attribute), &value)
+	if code != 0 || value == 0 {
+		return "", code
+	}
+	defer cfRelease(value)
+	if cfTypeID(value) != cfStringID() {
+		return "", code
+	}
+	return macnative.GoString(objc.ID(value)), code
+}
+
+func readAXElementSelection(ctx context.Context, node uintptr, outcome *string) (Selection, error) {
+	if err := ctx.Err(); err != nil {
+		return Selection{}, err
+	}
+	if subrole, _ := axStringAttribute(node, "AXSubrole"); subrole == "AXSecureTextField" {
+		return Selection{}, errProtectedSelection
+	}
+	if err := ctx.Err(); err != nil {
+		return Selection{}, err
+	}
+	text, code := axStringAttribute(node, "AXSelectedText")
+	if err := ctx.Err(); err != nil {
+		return Selection{}, err
+	}
+	switch code {
+	case axAttributeUnsupported, axNoValue:
+		*outcome = "attribute_missing"
+		return Selection{}, errTrySelectionParent
+	case 0:
+		// An explicit empty selection can be an insertion point. An enclosing
+		// element may still expose another selection, so keep copy as fallback.
+		if text != "" {
+			sel := Selection{Text: text, Via: "ax"}
+			sel.Rect, sel.HasRect = axSelectionBounds(node)
+			return sel, nil
+		}
+		*outcome = "empty"
+	default:
+		*outcome = "miss"
+	}
+	return Selection{}, ErrNoSelection
+}
+
+func axSelectionBounds(node uintptr) (Rect, bool) {
+	var span uintptr
+	if axAttribute(node, macnative.String("AXSelectedTextRange"), &span) != 0 || span == 0 {
+		return Rect{}, false
+	}
+	defer cfRelease(span)
+	if cfTypeID(span) != axValueID() || axValueType(span) != 4 {
+		return Rect{}, false
+	}
+	var bounds uintptr
+	if axParameter(node, macnative.String("AXBoundsForRange"), span, &bounds) != 0 || bounds == 0 {
+		return Rect{}, false
+	}
+	defer cfRelease(bounds)
+	var r macnative.Rect
+	if cfTypeID(bounds) == axValueID() && axValueType(bounds) == 3 && axValue(bounds, 3, unsafe.Pointer(&r)) &&
+		r.Size.Width > 0 && r.Size.Height > 0 && math.Abs(r.Origin.X) <= 1<<30 && math.Abs(r.Origin.Y) <= 1<<30 &&
+		r.Size.Width <= 1<<30 && r.Size.Height <= 1<<30 {
+		return Rect{int(math.Round(r.Origin.X)), int(math.Round(r.Origin.Y)), int(math.Round(r.Size.Width)), int(math.Round(r.Size.Height))}, true
+	}
+	return Rect{}, false
 }
 
 const macControlModifier = 1 << 18

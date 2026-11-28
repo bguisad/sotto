@@ -2,8 +2,8 @@ package selection
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
 	"sync/atomic"
 	"time"
 )
@@ -102,7 +102,7 @@ func waitCopyRelease(ctx context.Context, held func() bool) error {
 
 // Windows sources can publish a single copy in several batches, even with no
 // owner window. Wait for the last observed sequence to stay quiet before reading.
-func waitForStableCopy(ctx context.Context, before uint32, sample func() (uint32, error)) (uint32, error) {
+func waitForStableCopy(ctx context.Context, before uint32, sample func() (uint32, error)) (sequence uint32, err error) {
 	const settle = 40 * time.Millisecond
 	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
@@ -111,6 +111,12 @@ func waitForStableCopy(ctx context.Context, before uint32, sample func() (uint32
 
 	started := time.Now()
 	last, changedAt := before, started
+	changes := 0
+	defer func() {
+		if err != nil && (changes > 0 || errors.Is(err, context.DeadlineExceeded)) {
+			err = fmt.Errorf("changes=%d elapsed=%s: %w", changes, time.Since(started).Round(time.Millisecond), err)
+		}
+	}()
 	for {
 		if err := ctx.Err(); err != nil {
 			return 0, err
@@ -121,7 +127,7 @@ func waitForStableCopy(ctx context.Context, before uint32, sample func() (uint32
 		}
 		if seq != last {
 			last, changedAt = seq, time.Now()
-			log.Printf("selection: clipboard copy=changed seq=%d wait=%s", seq, changedAt.Sub(started).Round(time.Millisecond))
+			changes++
 		} else if seq != before && time.Since(changedAt) >= settle {
 			return seq, ctx.Err()
 		}
